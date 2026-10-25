@@ -3,7 +3,9 @@
 # Local snapshots of earlier builds, saves and documents
 /backup/
 # One-off probes and conversion helpers (native/tools/ is part of the build)
-/tools/
+/tools/*
+!/tools/build_appstore.py
+!/tools/check_public_tree.py
 /.research-tools/
 # Build output, including the assembled game bundles (they contain the games)
 native/build/
@@ -13,3 +15,17 @@ native/local.mk
 .DS_Store
 *.dSYM/
 __pycache__/
+
+# User-generated games and private local verification artifacts.
+/build/
+/.work/
+*.app/
+*.dmg
+*.DAT
+*.dat
+*.image
+*.log
+*_MASReceipt/
+**/_MASReceipt/
+SavedGames/
+Preferences Data*

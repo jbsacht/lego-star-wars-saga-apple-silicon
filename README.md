@@ -1,116 +1,111 @@
-# 32-bit LEGO games on modern macOS
+# LEGO Star Wars: The Complete Saga on Apple Silicon
 
-Run the original 32-bit Intel Mac LEGO releases on macOS 11 or later,
-including Apple Silicon through Rosetta 2. You need your own copy of each game.
+Experimental compatibility fixes for the **original Mac App Store 1.1.1 RC4 release** of LEGO Star Wars: The Complete Saga. Build a local Mac application using your own installed, purchased copy.
 
-| Game | Mac release | Status |
-| --- | --- | --- |
-| LEGO Star Wars: The Video Game | Aspyr, 2005; universal binary update in 2007 (initially PowerPC only) | - |
-| LEGO Star Wars II: The Original Trilogy | Aspyr, 2006 | - |
-| LEGO Indiana Jones: The Original Adventures | 2008 | - |
-| LEGO Batman: The Videogame | Feral, 2009 | - |
-| LEGO Star Wars: The Complete Saga | Feral, Steam 1.2.1 | ✓\* |
-| LEGO Indiana Jones 2: The Adventure Continues | Feral, 2009 | - |
-| LEGO Harry Potter: Years 1-4 | Feral, 2011 | - |
-| LEGO Star Wars III: The Clone Wars | Feral, 2011 | ✓\* |
-| LEGO Pirates of the Caribbean | TransGaming, 2011 | ✓\* |
-| LEGO Batman 2: DC Super Heroes | Feral, 2012 | - |
-| LEGO Harry Potter: Years 5-7 | Feral, 2012 | - |
-| LEGO The Lord of the Rings | Feral, 2013 | - |
-| LEGO Marvel Super Heroes | Feral, 2014 | ✓\* |
-| LEGO The Hobbit | Feral, Steam 1.0 | Experimental |
-| LEGO Batman 3: Beyond Gotham | Feral, Steam 1.0.3 | Experimental |
-| The LEGO Movie Videogame | Feral, Steam 1.0 | Experimental |
+This is a continuation of [Yash-Singh1/32-bit-ports](https://github.com/Yash-Singh1/32-bit-ports), based on commit `2245d949ff629a1c7d3e5ae53cbb49463183d627`. The upstream history and author credits are retained. The runtime bridges the original i386 game to modern macOS APIs and runs its Intel code through Rosetta 2; this is not a native ARM port or a replacement game engine.
 
-\* Not verified with a 100% run yet, report any bugs or problems in the issues tab.
+**Licensing status:** upstream has no explicit license in the checked revision. Do not assume that public source grants permission to redistribute runtime binaries or relicense the inherited code. See [NOTICE.md](NOTICE.md) before publishing a release. This repository does not include the Complete Saga executable, data, receipt, saves, or a ready-to-play application. The original upstream history contains its own existing icons for other games; no Complete Saga artwork has been added.
 
-## Building
+## Tested status
 
-Run `make converter` from `native/` to build `native/build/LEGO-Converter.app`.
-Drop or select an original Mac app or Steam game folder, choose the game if
-needed, then convert. Compiler tools are included. See the
-[converter notes](native/converter/README.md) for supported releases and building.
+Tested on one Apple M2 Max running macOS 27.0.1. Other M-series Macs and macOS versions need community testing. The installer deliberately rejects other game revisions instead of assuming compatibility.
 
-Requirements:
+Confirmed by the player:
 
-- macOS 11 or later.
-- Xcode command-line tools, installed with `xcode-select --install`.
-- Rosetta 2 on Apple Silicon, installed with `softwareupdate --install-rosetta`.
-- The original game application, fully installed.
-- For Pirates, Python 3 and network access for the first build's `unicorn` dependency.
+- Keyboard movement and lightsaber activation work.
+- A level was completed, saved, and reloaded.
+- The performance changes substantially improved play.
+- macOS fullscreen is correctly centered and shows the full image.
 
-The build detects the game from the source app's bundle identifier:
+The delayed integrity check passed against the original signed installation after five minutes; a six-minute idle test retained normal colors. Full-campaign stability, audible mixing quality, controllers with this App Store edition, and long play sessions have not been verified. An intermediate fullscreen test also reached an unsupported C++ exception path; it has not recurred in the final display check, and should be reported if reproduced. This is an experimental community project, not a publisher-supported release.
+
+## Requirements
+
+- Your fully installed **Mac App Store 1.1.1 RC4** game, including its receipt. The setup checks the executable hash against the tested revision.
+- An Apple Silicon Mac with Rosetta 2 already installed.
+- Xcode command-line tools or Xcode, including a macOS SDK with the legacy system frameworks used by the runtime.
+- Python 3, Git, and enough free storage for a local copy of the game data (about 4.4 GB, plus build files).
+
+The current build was checked with Xcode/macOS SDK 27. The minimum OS claimed by the inherited runtime is macOS 11; that full range has **not** been tested here.
+
+## Build your application
+
+Clone or download the repository. Open Terminal in its folder.
+
+Check your installed release without changing anything:
 
 ```sh
-cd native
-make SOURCE_APP="/path/to/LEGO The Hobbit.app" bundle
+python3 tools/build_appstore.py --check \
+  --source "/Applications/LEGO Star Wars Saga.app"
 ```
 
-You can also select the game explicitly:
+Quit any running compatibility copy, then build:
 
 ```sh
-make GAME=pirates   SOURCE_APP="/path/to/LEGO Pirates of the Caribbean.app" bundle
-make GAME=clonewars SOURCE_APP="/path/to/LEGO Star Wars III.app"            bundle
-make GAME=marvel    SOURCE_APP="/path/to/LEGO Marvel Super Heroes.app"      bundle
-make GAME=saga      SOURCE_APP="/path/to/LEGO Star Wars Saga.app"          bundle
-make GAME=batman3   SOURCE_APP="/path/to/LEGO Batman 3.app"                 bundle
-make GAME=movie     SOURCE_APP="/path/to/The LEGO Movie.app"              bundle
-make GAME=hobbit    SOURCE_APP="/path/to/LEGO The Hobbit.app"              bundle
+python3 tools/build_appstore.py \
+  --source "/Applications/LEGO Star Wars Saga.app" \
+  --configure-display
 ```
 
-The generated compatibility app appears in `native/build/`. The build copies
-in the game's data and resources and leaves the original app unchanged.
-Open the generated app from Finder or the Dock.
+The script compiles the runtime, checks the original game's signature through native Security APIs, copies the original resources and receipt **on your Mac**, and creates:
 
-Fullscreen launch placement records the frontmost app's visible window before
-game initialization, then falls back to the display under the pointer. Later
-fullscreen frame changes keep the game on its current display. The Cocoa bridge queries
-[`NSScreen.mainScreen`](https://developer.apple.com/documentation/appkit/nsscreen/main)
-on each call. Quartz's primary display stays independent of the game window,
-and emulated display modes retain the selected display's desktop origin.
-`LP32_DISPLAY_INDEX`, `LP32_TEST_DISPLAY` and `LP32_USE_SECONDARY_DISPLAY`
-remain explicit display overrides for test launches.
+```text
+build/LEGO Star Wars Saga (Apple Silicon).app
+```
 
-Batman 3, The LEGO Movie, and The Hobbit default to their standard Steam
-library locations when `GAME` is specified without `SOURCE_APP`. For other
-install locations, pass `SOURCE_APP` explicitly. To check game detection before
-building, run `make SOURCE_APP="/path/to/Game.app" game-info`.
+`--configure-display` backs up existing preferences and sets only the old game's `FullScreen` preference to `0`. It does not delete saves, reset controls, or change other game options. A first-time preferences file is created if necessary. If you omit the flag, choose windowed mode in the original launcher yourself. Keeping the legacy fullscreen setting off allows macOS to manage fullscreen safely.
 
-`GAME=saga` defaults to the Steam edition and requires `SOURCE_APP`. Its output
-is `native/build/LEGOCompleteSaga-Steam-Compat.app`; keep the generated
-`LEGOStarWarsSagaData` directory beside it. The retail edition uses
-`SAGA_EDITION=retail`. See [native/SAGA.md](native/SAGA.md) for edition-specific
-build instructions and [native/MARVEL-STEAM.md](native/MARVEL-STEAM.md) for
-Marvel's Steam build instructions.
-
-Pirates automatically unpacks its shipped executable during the build. The
-first build creates `native/build/venv` and installs `unicorn`. To use an
-existing Python environment with `unicorn`, pass `PYTHON=/path/to/python3`.
-
-To update the loader in an existing compatibility app without copying the
-game data again:
+The source app is never overwritten. The output path must not already exist. An alternate destination is supported:
 
 ```sh
-make GAME=hobbit promote-loader
+python3 tools/build_appstore.py \
+  --source "/Applications/LEGO Star Wars Saga.app" \
+  --output "$HOME/Applications/LEGO Star Wars Saga (Apple Silicon).app" \
+  --configure-display
 ```
 
-Add `CONTINUE_WHEN_INACTIVE=1` to `bundle` or `promote-loader` to keep the game
-running while another app is active. It defaults to `0`. To save a personal
-build preference, put `CONTINUE_WHEN_INACTIVE = 1` in the git-ignored
-`native/local.mk`.
+The generated app can be moved into Applications afterward. **Keep the original signed game installed at its original path**: the runtime validates that installation rather than the compatibility loader's ad-hoc signature. Moving the source later requires rebuilding the compatibility app. Rosetta must remain installed.
 
-Startup diagnostics are saved to `~/Library/Logs/LP32Compat/startup.log`
-before the game image loads. After loading, the session log is in the game's
-log directory, such as `~/Library/Logs/LEGOCloneWarsCompat/last-run.log`.
-Include these logs when reporting a launch failure.
+## Play
 
-Display regression checks can run without loading a game or changing the
-system display layout:
+1. Open the generated application and click **Play**.
+2. Press **Enter** at the title prompt to select the keyboard.
+3. Choose **Load Game** or **New Game**.
+4. Use the green window button or **Control–Command–F** for macOS fullscreen. The same shortcut exits fullscreen. Black letterboxing may appear to preserve the game's aspect ratio; the image is never intentionally cropped.
+5. After switching apps, select **Resume** if the game is paused.
 
-```sh
-make -C native test-display-bridge
+The verified configuration had shadows and bloom disabled. If a different configuration fails, include those settings in a bug report. Performance depends on the scene and machine; the bridge caps presentation near 60 FPS because the game simulation is frame dependent.
+
+Settings and saves use the game's existing folder:
+
+```text
+~/Library/Application Support/Feral Interactive/LEGO Star Wars Saga/
 ```
 
-The check exercises changing Cocoa focus, Quartz primary-display queries,
-launch placement, fullscreen window moves, and emulated mode isolation on
-all attached displays.
+Back up that folder before testing experimental builds. Generated apps and copies of game files must stay local and must not be uploaded to this repository or attached to issues.
+
+## What changed
+
+The fixes cover Carbon windows and Cocoa presentation, keyboard delivery and focus recovery, QuickTime movie/image handling, audio callback and converter lifetimes, missing physics and save/date APIs, and OpenGL compatibility. RTTI caching and direct shader-parameter dispatch remove substantial per-frame bridge overhead.
+
+The persistent green tint was caused by the game's delayed integrity check seeing the ad-hoc loader identity. The bridge now validates the installed signed original with native `SecStaticCodeCheckValidity`, preserving the requested requirement and flags. It does not force a successful result or disable the game's checks.
+
+Fullscreen uses a separate, centered render view with a fixed backing surface matching the guest's actual viewport. This avoids confusing the taller desktop mode with the game image size.
+
+See [docs/VERIFICATION.md](docs/VERIFICATION.md) for the test matrix and [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md) for the inherited project's other editions and titles. Steam and DVD workflows in those inherited documents are **not** evidence that this App Store setup script supports them.
+
+## Contributing and reporting issues
+
+Use the issue templates and include the Mac model, macOS version, game edition, scene/action, fullscreen state, and whether it reproduces with shadows and bloom off. Do not upload receipts, save files, product keys, full game apps, or game archives. Redact account names and local paths from log excerpts.
+
+Diagnostics are written to:
+
+```text
+~/Library/Logs/LEGOCompleteSagaCompat/last-run.log
+```
+
+Use small relevant excerpts rather than whole logs. Review changes against the upstream base; many inherited files support other games. Avoid claiming they have been tested by this project.
+
+## Maintainer: publish with GitHub Desktop
+
+See [docs/GITHUB-DESKTOP.md](docs/GITHUB-DESKTOP.md). No GitHub CLI authentication is required to use this local repository. Public distribution and licensing still need the review described in `NOTICE.md`.
