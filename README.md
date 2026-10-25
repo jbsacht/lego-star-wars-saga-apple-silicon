@@ -4,7 +4,7 @@ Experimental compatibility fixes for the **original Mac App Store 1.1.1 RC4 rele
 
 This is a continuation of [Yash-Singh1/32-bit-ports](https://github.com/Yash-Singh1/32-bit-ports), based on commit `2245d949ff629a1c7d3e5ae53cbb49463183d627`. The upstream history and author credits are retained. The runtime bridges the original i386 game to modern macOS APIs and runs its Intel code through Rosetta 2; this is not a native ARM port or a replacement game engine.
 
-**Licensing status:** upstream has no explicit license in the checked revision. Do not assume that public source grants permission to redistribute runtime binaries or relicense the inherited code. See [NOTICE.md](NOTICE.md) before publishing a release. This repository does not include the Complete Saga executable, data, receipt, saves, or a ready-to-play application. The original upstream history contains its own existing icons for other games; no Complete Saga artwork has been added.
+**Licensing:** the upstream revision does not include a standard open-source license, and this project does not assign one to the inherited code. See [NOTICE.md](NOTICE.md) for attribution and distribution notes. This repository does not include the Complete Saga executable, data, receipt, saves, or a ready-to-play application. The original upstream history contains its own existing icons for other games; no Complete Saga artwork has been added.
 
 ## Tested status
 
