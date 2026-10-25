@@ -117,8 +117,9 @@ char *arb_program_guard_undefined_math(const void *raw_source,
         while (option < option_limit && (*option == ' ' || *option == '\t')) {
             ++option;
         }
-        if ((size_t)(option_limit - option) < 7 ||
-            memcmp(option, "OPTION ", 7) != 0) {
+        if (option < option_limit && *option != '\r' && *option != '#' &&
+            ((size_t)(option_limit - option) < 7 ||
+             memcmp(option, "OPTION ", 7) != 0)) {
             break;
         }
         header_size = option_end < source_size ? option_end + 1 : option_end;

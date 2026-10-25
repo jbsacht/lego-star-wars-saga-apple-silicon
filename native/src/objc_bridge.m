@@ -1,3 +1,4 @@
+#include "carbon_ui.h"
 #import <CoreText/CoreText.h>
 #import <Security/Security.h>
 #include "objc_bridge.h"
@@ -1644,6 +1645,29 @@ static NSBundle *legacy_game_bundle(void)
     return bundle;
 }
 
+/* A translated guest cannot use the loader process's ad-hoc signature as
+   its own identity. Validate its installed source bundle with Security,
+   retaining the caller's requirement and validation flags. */
+static SecStaticCodeRef translated_guest_code;
+
+static OSStatus copy_translated_guest_code(SecCSFlags flags, SecCodeRef *code)
+{
+    NSString *path = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"LP32GuestCodeBundlePath"];
+    if (!path && getenv("LP32_SECURITY_SELFTEST"))
+        path = [NSString stringWithUTF8String:getenv("LP32_SECURITY_SELFTEST")];
+    if (!path) return SecCodeCopySelf(flags, code);
+    if (flags != kSecCSDefaultFlags) return errSecCSInvalidFlags;
+    if (!translated_guest_code) {
+        OSStatus status = SecStaticCodeCreateWithPath(
+            (CFURLRef)[NSURL fileURLWithPath:path], flags, &translated_guest_code);
+        fprintf(stderr, "compat32: guest code identity source=%s status=%d\n",
+                [path fileSystemRepresentation], (int)status);
+        if (status) return status;
+    }
+    *code = (SecCodeRef)CFRetain(translated_guest_code);
+    return errSecSuccess;
+}
+
 static size_t guest_words_for_type(const char *type)
 {
     type = skip_type_qualifiers(type);
@@ -2950,6 +2974,26 @@ static void frame_pacer_wait(NSWindow *window)
         last_present_ns = now_ns;
         next_slot_ns = now_ns + interval_ns;
     }
+}
+
+void objc_bridge32_pace_frame(void *native_window)
+{
+    ++objc_bridge_swap_count;
+    trace_gl_frame_boundary();
+    if (objc_bridge_swap_count % 120 == 0) {
+        static unsigned last_mask = UINT_MAX;
+        GLboolean channels[4] = {0};
+        glGetBooleanv(GL_COLOR_WRITEMASK, channels);
+        unsigned mask = !!channels[0] | (!!channels[1] << 1) |
+            (!!channels[2] << 2) | (!!channels[3] << 3);
+        if (mask != last_mask) {
+            fprintf(stderr, "compat32: frame color write mask=%u%u%u%u swap=%llu\n",
+                !!channels[0], !!channels[1], !!channels[2], !!channels[3],
+                (unsigned long long)objc_bridge_swap_count);
+            last_mask = mask;
+        }
+    }
+    frame_pacer_wait((NSWindow *)native_window);
 }
 
 @interface OpenGLView : NSOpenGLView
@@ -5006,14 +5050,17 @@ static void report_sanitized_program_parameters(
     const char *kind, GLenum target, GLuint index, GLsizei count,
     size_t replaced)
 {
-    if (!replaced || program_parameter_sanitize_reports >= 8) return;
+    static unsigned double_reports;
+    unsigned *reports = !strcmp(kind, "local-double-parameter") ?
+        &double_reports : &program_parameter_sanitize_reports;
+    if (!replaced || *reports >= 8) return;
     fprintf(stderr,
             "compat32: sanitized %zu non-finite %s component%s "
             "swap=%llu target=%04x index=%u count=%d vp=%u fp=%u\n",
             replaced, kind, replaced == 1 ? "" : "s",
             (unsigned long long)objc_bridge_swap_count, target, index, count,
             trace_vertex_program, trace_fragment_program);
-    ++program_parameter_sanitize_reports;
+    ++*reports;
 }
 
 static size_t gl_attribute_component_size(GLenum type)
@@ -6485,6 +6532,23 @@ FAST_GL(glProgramLocalParameter4fvARB)
     return 0;
 }
 
+FAST_GL(glProgramLocalParameter4dARB)
+{
+    (void)return_address;
+    GLfloat values[4];
+    for (unsigned i = 0; i < 4; ++i) {
+        double value;
+        memcpy(&value, arguments + 2 + i * 2, sizeof(value));
+        values[i] = (GLfloat)value;
+    }
+    size_t replaced = 0;
+    const GLfloat *upload = safe_program_parameter_values(values, 1, &replaced);
+    report_sanitized_program_parameters("local-double-parameter", arguments[0], arguments[1], 1, replaced);
+    trace_program_parameter_upload("glProgramLocalParameter4dARB", arguments[0], arguments[1], 1, upload);
+    glProgramLocalParameter4fvARB(arguments[0], arguments[1], upload);
+    return 0;
+}
+
 FAST_GL(glBindProgramARB)
 {
     if (hitch_recorder_enabled) hitch_program(arguments[0], arguments[1]);
@@ -6628,7 +6692,7 @@ FAST_GL(glCullFace)   { (void)return_address; glCullFace(arguments[0]); return 0
 FAST_GL(glDepthFunc)  { (void)return_address; glDepthFunc(arguments[0]); return 0; }
 FAST_GL(glDepthMask)  { (void)return_address; glDepthMask(arguments[0]); return 0; }
 FAST_GL(glFrontFace)  { (void)return_address; glFrontFace(arguments[0]); return 0; }
-FAST_GL(glScissor)    { (void)return_address; glScissor(arguments[0], arguments[1], arguments[2], arguments[3]); return 0; }
+FAST_GL(glScissor)    { (void)return_address; if (!carbon_ui_gl_rect(arguments, 0)) glScissor(arguments[0], arguments[1], arguments[2], arguments[3]); return 0; }
 FAST_GL(glStencilFunc){ (void)return_address; glStencilFunc(arguments[0], arguments[1], arguments[2]); return 0; }
 FAST_GL(glStencilMask){ (void)return_address; glStencilMask(arguments[0]); return 0; }
 FAST_GL(glStencilOp)  { (void)return_address; glStencilOp(arguments[0], arguments[1], arguments[2]); return 0; }
@@ -6661,6 +6725,7 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"glProgramLocalParameters4fvEXT", fast_glProgramLocalParameters4fvEXT},
         {"glProgramEnvParameter4fvARB", fast_glProgramEnvParameter4fvARB},
         {"glProgramLocalParameter4fvARB", fast_glProgramLocalParameter4fvARB},
+        {"glProgramLocalParameter4dARB", fast_glProgramLocalParameter4dARB},
         {"glBindProgramARB", fast_glBindProgramARB},
         {"glBindBuffer", fast_glBindBuffer},
         {"glBindBufferARB", fast_glBindBuffer},
@@ -7354,6 +7419,18 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = kCGErrorSuccess;
         return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayMoveCursorToPoint")) {
+        float x, y; memcpy(&x, arguments + 1, 4); memcpy(&y, arguments + 2, 4);
+        *result = CGDisplayMoveCursorToPoint(arguments[0], CGPointMake(x, y));
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetDisplaysWithPoint")) {
+        float x, y;
+        memcpy(&x, arguments, 4); memcpy(&y, arguments + 1, 4);
+        *result = CGGetDisplaysWithPoint(CGPointMake(x, y), arguments[2],
+            (CGDirectDisplayID *)(uintptr_t)arguments[3], (uint32_t *)(uintptr_t)arguments[4]);
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRelease") ||
         LP32_NAME_IS(import_name, import_length, "_CGReleaseAllDisplays")) {
         /* Releasing another display must not discard this display's mode. */
@@ -7365,7 +7442,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = kCGErrorSuccess;
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCapture") ||
+    if (LP32_NAME_IS(import_name, import_length, "_CGCaptureAllDisplays") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayCapture") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayFade") ||
@@ -8412,6 +8490,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "glProgramLocalParameter4fvARB")) {
         *result = fast_glProgramLocalParameter4fvARB(arguments, 0); return 1;
     }
+    if (LP32_NAME_IS(import_name, import_length, "glProgramLocalParameter4dARB")) {
+        *result = fast_glProgramLocalParameter4dARB(arguments, 0); return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "glProgramLocalParameters4fvEXT")) {
         *result = fast_glProgramLocalParameters4fvEXT(arguments, 0); return 1;
     }
@@ -8616,7 +8697,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     (GLint)arguments[0], (GLint)arguments[1],
                     (GLsizei)arguments[2], (GLsizei)arguments[3]);
         }
-        glViewport(arguments[0], arguments[1], arguments[2], arguments[3]);
+        if (!carbon_ui_gl_rect(arguments, 1)) glViewport(arguments[0], arguments[1], arguments[2], arguments[3]);
         *result = 0; return 1;
     }
     /* Fixed-function immediate mode used by the Clone Wars Feral layer for
@@ -8906,14 +8987,23 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_SecCodeCopySelf")) {
         SecCodeRef code = NULL;
-        OSStatus status = SecCodeCopySelf(arguments[0], &code);
+        OSStatus status = copy_translated_guest_code(arguments[0], &code);
         if (arguments[1]) *(uint32_t *)(uintptr_t)arguments[1] = proxy_for_object((id)code);
         if (code) CFRelease(code);
         *result = (uint32_t)status; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_SecCodeCheckValidity")) {
-        *result = (uint32_t)SecCodeCheckValidity((SecCodeRef)object_for_argument(arguments[0]),
-            arguments[1], (SecRequirementRef)object_for_argument(arguments[2]));
+        SecCodeRef code = (SecCodeRef)object_for_argument(arguments[0]);
+        SecRequirementRef requirement = (SecRequirementRef)object_for_argument(arguments[2]);
+        OSStatus status = translated_guest_code && code == (SecCodeRef)translated_guest_code ?
+            SecStaticCodeCheckValidity(translated_guest_code, arguments[1], requirement) :
+            SecCodeCheckValidity(code, arguments[1], requirement);
+        static unsigned reports;
+        if (reports++ < 8)
+            fprintf(stderr, "compat32: guest code validity source=%s status=%d\n",
+                    code == (SecCodeRef)translated_guest_code ? "installed guest" : "native process",
+                    (int)status);
+        *result = (uint32_t)status;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFAllocatorGetDefault")) {
@@ -8998,7 +9088,11 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                itself, so the bridge answers for the launcher. */
             thunk = compat_runtime32_guest_callback(kFeralMainEntryCallbackName);
         } else if (symbol && (carbon_bridge32_has_symbol(symbol) || dlsym(RTLD_DEFAULT, symbol))) {
-            thunk = compat_runtime32_guest_callback(symbol);
+            /* CFBundle supplies C symbol names; the import dispatchers use
+               Mach-O names with a leading underscore, as dlsym's bridge does. */
+            char imported[96];
+            if (snprintf(imported, sizeof(imported), "_%s", symbol) < (int)sizeof(imported))
+                thunk = compat_runtime32_guest_callback(imported);
         }
         if (getenv("LP32_TRACE_DISPLAY")) {
             fprintf(stderr, "compat32: CFBundleGetFunctionPointerForName %s -> %#x\n",
@@ -9019,6 +9113,17 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         const char *test_home = getenv("LP32_TEST_HOME_DIR");
         *result = proxy_for_object(test_home && test_home[0] ?
             [NSString stringWithUTF8String:test_home] : NSHomeDirectory());
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_SetApplicationDockTileImage") ||
+        LP32_NAME_IS(import_name, import_length, "_RestoreApplicationDockTileImage")) {
+        NSImage *image = nil;
+        if (LP32_NAME_IS(import_name, import_length, "_SetApplicationDockTileImage") && arguments[0]) {
+            CGImageRef cg = (CGImageRef)object_for_argument(arguments[0]);
+            image = [[[NSImage alloc] initWithCGImage:cg size:NSZeroSize] autorelease];
+        }
+        [NSApp setApplicationIconImage:image];
+        *result = noErr;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFURLCreateFromFSRef")) {
@@ -10479,6 +10584,49 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     return 0;
 }
 
+int objc_bridge32_run_security_self_test(void)
+{
+    @autoreleasepool {
+        uint32_t output = compat_runtime32_allocate(4, 1);
+        uint64_t result = 0;
+        uint32_t copy_args[] = {0, output};
+        if (!output || !objc_bridge32_dispatch("_SecCodeCopySelf", copy_args, &result) || result) {
+            fprintf(stderr, "security-selftest: CopySelf failed result=%lld output=%#x\n", (long long)result, output);
+            return -1;
+        }
+        uint32_t code = *(uint32_t *)(uintptr_t)output;
+        if (!code || !translated_guest_code) {
+            fprintf(stderr, "security-selftest: missing code token=%#x native=%p\n", code, translated_guest_code);
+            return -1;
+        }
+        const char *requirements[] = {"anchor apple generic", "identifier \"com.feralinteractive.Saga\"",
+                                     "identifier \"invalid.compatibility.test\""};
+        for (unsigned i = 0; i < 3; ++i) {
+            SecRequirementRef requirement = NULL;
+            NSString *text = [NSString stringWithUTF8String:requirements[i]];
+            if (SecRequirementCreateWithString((CFStringRef)text, 0, &requirement)) return -1;
+            uint32_t args[] = {code, 0, proxy_for_object((id)requirement)};
+            OSStatus expected = SecStaticCodeCheckValidity(translated_guest_code, 0, requirement);
+            fprintf(stderr, "security-selftest: requirement=%s native status=%d\n", requirements[i], (int)expected);
+            if ((i < 2 && expected) || (i == 2 && !expected) ||
+                !objc_bridge32_dispatch("_SecCodeCheckValidity", args, &result) ||
+                (OSStatus)result != expected) return -1;
+            CFRelease(requirement);
+        }
+        /* The same Apple requirement must still reject the ad-hoc host. */
+        SecCodeRef host = NULL;
+        SecRequirementRef apple = NULL;
+        if (SecCodeCopySelf(0, &host) ||
+            SecRequirementCreateWithString(CFSTR("anchor apple generic"), 0, &apple)) return -1;
+        uint32_t host_args[] = {proxy_for_object((id)host), 0, proxy_for_object((id)apple)};
+        if (!objc_bridge32_dispatch("_SecCodeCheckValidity", host_args, &result) || !result) return -1;
+        CFRelease(host); CFRelease(apple);
+        compat_runtime32_deallocate(output);
+        puts("security-selftest: PASS (original signed guest accepted, wrong identity and ad-hoc host rejected, native Security results preserved)");
+        return 0;
+    }
+}
+
 int objc_bridge32_run_gl_parameter_self_test(void)
 {
     if (split_program_parameter_batches()) {
@@ -10517,7 +10665,36 @@ int objc_bridge32_run_gl_parameter_self_test(void)
         return -1;
     }
 
-    puts("gl-parameter-selftest: PASS (atomic batch policy and finite containment)");
+    /* Check the scalar-double guest ABI against actual driver state. */
+    @autoreleasepool {
+        NSOpenGLPixelFormatAttribute attrs[] = {NSOpenGLPFAAccelerated, 0};
+        NSOpenGLPixelFormat *format = [[[NSOpenGLPixelFormat alloc] initWithAttributes:attrs] autorelease];
+        NSOpenGLContext *context = [[[NSOpenGLContext alloc] initWithFormat:format shareContext:nil] autorelease];
+        if (!context) return -1;
+        CGLContextObj previous = CGLGetCurrentContext();
+        [context makeCurrentContext];
+        GLuint program = 0;
+        glGenProgramsARB(1, &program); glBindProgramARB(GL_VERTEX_PROGRAM_ARB, program);
+        uint32_t args[10] = {GL_VERTEX_PROGRAM_ARB, 3};
+        const double tests[][4] = {{1.25, -2.5, 3.0, 0.0}, {NAN, INFINITY, -INFINITY, 4.0}};
+        const GLfloat expected[][4] = {{1.25f, -2.5f, 3.0f, 0.0f}, {0, 0, 0, 4.0f}};
+        int failed = 0;
+        lp32_fast_import_fn fast = objc_bridge32_fast_import("_glProgramLocalParameter4dARB");
+        if (!fast) failed = 1;
+        for (unsigned i = 0; !failed && i < 2; ++i) {
+            memcpy(args + 2, tests[i], sizeof(tests[i]));
+            uint64_t result;
+            if (!objc_bridge32_dispatch("_glProgramLocalParameter4dARB", args, &result)) failed = 1;
+            if (!failed) fast(args, 0);
+            GLfloat readback[4] = {0};
+            glGetProgramLocalParameterfvARB(GL_VERTEX_PROGRAM_ARB, 3, readback);
+            if (memcmp(readback, expected[i], sizeof(readback)) || glGetError()) failed = 1;
+        }
+        glDeleteProgramsARB(1, &program);
+        CGLSetCurrentContext(previous);
+        if (failed) return -1;
+    }
+    puts("gl-parameter-selftest: PASS (atomic batches, finite containment, scalar-double ABI, driver readback, fast path)");
     return 0;
 }
 
@@ -11850,4 +12027,8 @@ int objc_bridge32_run_display_self_test(void)
 #undef DISPLAY_CHECK
         return valid ? 0 : -1;
     }
+}
+
+void objc_bridge32_guest_display_size(int *width, int *height) {
+  *width = guest_display_mode.width; *height = guest_display_mode.height;
 }

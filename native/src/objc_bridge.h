@@ -31,6 +31,7 @@ float objc_bridge32_preferred_display_aspect_ratio(void);
 struct lp32_screen_aspect_patch;
 int objc_bridge32_run_panel_scale_self_test(const struct lp32_screen_aspect_patch *patch);
 int objc_bridge32_run_gl_parameter_self_test(void);
+int objc_bridge32_run_security_self_test(void);
 int objc_bridge32_run_gl_buffer_self_test(void);
 int objc_bridge32_run_gl_texture_self_test(void);
 
@@ -41,3 +42,6 @@ void objc_bridge32_commit_borrowed_bytes(void *owner,void *bytes,size_t length,u
 void objc_bridge32_release_borrowed_bytes(void *owner,unsigned slot);
 uint32_t objc_bridge32_borrowed_object(void *owner,void *object,unsigned slot);
 #endif
+
+void objc_bridge32_guest_display_size(int *width, int *height);
+void objc_bridge32_pace_frame(void *native_window);

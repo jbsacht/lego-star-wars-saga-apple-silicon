@@ -1,3 +1,4 @@
+#include "carbon_ui.h"
 #include "compat_runtime.h"
 #include "tlv_bridge.h"
 #include "hitch_recorder.h"
@@ -3194,6 +3195,25 @@ static uint32_t *uncached_import_return_for_test(uint32_t *stack)
 int compat_runtime32_run_import_return_self_test(void)
 {
     {
+        /* Exercise float argument bits and integer return values across the
+           i386 gateway, including the value seen at Saga's debris crash. */
+        static const struct { uint32_t bits, expected; } values[] = {
+            {0x3c7374d1, 1}, {0, 1}, {0x80000000, 1}, {1, 1},
+            {0x7f7fffff, 1}, {0xff7fffff, 1}, {0x7f800000, 0},
+            {0xff800000, 0}, {0x7fc00000, 0}, {0x7f800001, 0}
+        };
+        uint32_t finite = compat_runtime32_guest_callback("___isfinitef");
+        if (!finite) return -1;
+        for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+            uint32_t args[] = {values[i].bits};
+            if (compat_runtime32_dispatch_import("___isfinitef", args) != values[i].expected)
+                return -1;
+            for (unsigned pass = 0; pass < 2; ++pass)
+                if (compat_runtime32_call(finite, args, 1) != values[i].expected) return -1;
+        }
+        fprintf(stderr, "Float finite classification PASS (guest ABI, debris value, zeros, subnormal, limits, infinities, NaNs)\n");
+    }
+    {
         /* Guest calls must return i386 EDX:EAX: guest Objective-C methods
            return CGSize/NSPoint/NSRange/long long in that register pair. */
         uint8_t *code = mmap((void *)0x76100000, 4096,
@@ -3687,6 +3707,12 @@ static uint64_t fast_pthread_setspecific(const uint32_t *arguments,
     return 0;
 }
 
+static uint64_t fast_dynamic_cast(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return rtti_bridge32_cast(arguments[0], arguments[1], arguments[2]);
+}
+
 static lp32_fast_import_fn runtime_fast_import(const char *name)
 {
     static const struct {
@@ -3708,6 +3734,7 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
         {"_lp32_tlv_get_addr", tlv_bridge32_fast_address},
         {"_logf", fast_logf},
         {"_expf", fast_expf},
+        {"___dynamic_cast", fast_dynamic_cast},
         {"_pthread_mutex_lock", fast_pthread_mutex_lock},
         {"_pthread_mutex_trylock", fast_pthread_mutex_trylock},
         {"_pthread_mutex_unlock", fast_pthread_mutex_unlock},
@@ -4965,6 +4992,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
             fprintf(stderr, "compat32: usleep(%" PRIu32 ") from 0x%08" PRIx32 "\n",
                     arguments[0], return_address);
         }
+        if (carbon_ui_pump_sleep(arguments[0])) return 0;
         return (uint32_t)usleep(arguments[0]);
     }
     if (import_is(name, "_OSMemoryBarrier")) {
@@ -4979,7 +5007,8 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
         int64_t value; memcpy(&value, arguments, 8);
         return __atomic_add_fetch((int64_t *)(uintptr_t)arguments[2], value, __ATOMIC_SEQ_CST);
     }
-    if (import_is(name, "_OSAtomicCompareAndSwap32") ||
+    if (import_is(name, "_CompareAndSwap") ||
+        import_is(name, "_OSAtomicCompareAndSwap32") ||
         import_is(name, "_OSAtomicCompareAndSwapInt") ||
         import_is(name, "_OSAtomicCompareAndSwap32Barrier") ||
         import_is(name, "_OSAtomicCompareAndSwapPtrBarrier")) {
@@ -5036,6 +5065,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_frexp")) return return_guest_double(frexp(guest_double(arguments), (void *)(uintptr_t)arguments[2]));
     if (import_is(name, "_modf")) return return_guest_double(modf(guest_double(arguments), (void *)(uintptr_t)arguments[2]));
     if (import_is(name, "___isfinited")) return isfinite(guest_double(arguments)) != 0;
+    if (import_is(name, "___isfinitef")) return isfinite(guest_float(arguments[0])) != 0;
     if (import_is(name, "___isinfd")) return isinf(guest_double(arguments)) != 0;
     if (import_is(name, "___isinff")) return isinf(guest_float(arguments[0])) != 0;
     if (import_is(name, "___isnand")) return isnan(guest_double(arguments)) != 0;
@@ -5064,6 +5094,7 @@ static uint64_t dispatch_named_import_body(uint32_t import_id, const char *name,
     if (import_is(name, "_ceil")) return return_guest_double(ceil(guest_double(arguments)));
     if (import_is(name, "_floor")) return return_guest_double(floor(guest_double(arguments)));
     if (import_is(name, "_rint")) return return_guest_double(rint(guest_double(arguments)));
+    if (import_is(name, "_lrint")) return (uint32_t)(int32_t)lrint(guest_double(arguments));
     if (import_is(name, "_ldexp")) {
         return return_guest_double(ldexp(guest_double(arguments), (int)arguments[2]));
     }

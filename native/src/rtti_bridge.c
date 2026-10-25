@@ -15,6 +15,7 @@ static struct {
   unsigned kind;
 } types[4096];
 static unsigned type_count;
+static unsigned type_epoch;
 static unsigned rtti_kind(const char *name) {
   if (!strcmp(name, "__ZTVN10__cxxabiv117__class_type_infoE")) return 1;
   if (!strcmp(name, "__ZTVN10__cxxabiv120__si_class_type_infoE")) return 2;
@@ -82,6 +83,7 @@ static void bind_types(const uint8_t *p, const uint8_t *end,
   }
 }
 void rtti_bridge32_initialize(const struct macho_image32 *image) {
+  ++type_epoch;
   type_count = 0;
   const struct symtab_command *sym = NULL;
   const struct dysymtab_command *dysym = NULL;
@@ -141,10 +143,19 @@ void rtti_bridge32_initialize(const struct macho_image32 *image) {
 }
 static const uint32_t *words(uint32_t p) { return (const void *)(uintptr_t)p; }
 static unsigned kind_of(uint32_t type) {
+  static _Thread_local struct { uint32_t type; unsigned kind; } cache[1024];
+  static _Thread_local unsigned cached_count, cached_epoch;
+  if (cached_count != type_count || cached_epoch != type_epoch) {
+    memset(cache, 0, sizeof(cache));
+    cached_count = type_count; cached_epoch = type_epoch;
+  }
+  unsigned slot = ((type >> 4) ^ (type >> 14)) & 1023;
+  if (cache[slot].type == type) return cache[slot].kind;
+  unsigned kind = 0;
   for (unsigned i = 0; i < type_count; ++i)
-    if (types[i].address == type)
-      return types[i].kind;
-  return 0;
+    if (types[i].address == type) { kind = types[i].kind; break; }
+  cache[slot].type = type; cache[slot].kind = kind;
+  return kind;
 }
 static bool same_type(uint32_t a, uint32_t b) {
   return a == b || (a && b && kind_of(a) && kind_of(b) &&
@@ -204,7 +215,8 @@ uint32_t rtti_bridge32_cast(uint32_t object, uint32_t source, uint32_t target) {
            type = words(vtable - 4)[0];
   if (!kind_of(type))
     return 0;
-  struct hierarchy all = {0};
+  struct hierarchy all;
+  all.count = 0; all.overflow = false;
   visit(&all, type, complete, true, 0);
   if (all.overflow)
     return 0;
@@ -217,7 +229,8 @@ uint32_t rtti_bridge32_cast(uint32_t object, uint32_t source, uint32_t target) {
       source_public = true;
     if (!same_type(candidate->type, target))
       continue;
-    struct hierarchy descendants = {0};
+    struct hierarchy descendants;
+    descendants.count = 0; descendants.overflow = false;
     visit(&descendants, target, candidate->address, true, 0);
     if (descendants.overflow)
       return 0;

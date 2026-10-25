@@ -823,6 +823,12 @@ static uint64_t shader_source(const uint32_t *a,uint32_t site) {
     glShaderSource(a[0],count,strings,(void *)(uintptr_t)a[3]);free(strings);return 0;
 }
 int gl_core_bridge32_dispatch(const char *name,const uint32_t *a,uint64_t *out){
+    if (!strcmp(name, "_glFinishObjectAPPLE") || !strcmp(name, "_glTestObjectAPPLE")) {
+        glFinish();
+        *out = !strcmp(name, "_glTestObjectAPPLE") ? GL_TRUE : 0;
+        return 1;
+    }
+
     if(!strcmp(name,"_glShaderSource")||!strcmp(name,"glShaderSource")){*out=shader_source(a,0);return 1;}
     lp32_fast_import_fn fn=gl_core_bridge32_fast_import(name);if(!fn)return 0;*out=fn(a,0);return 1;
 }

@@ -5,6 +5,8 @@
 
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result);
+int audio_bridge32_run_callback_replacement_self_test(void);
+int audio_bridge32_run_converter_self_test(void);
 
 /* Writes the recent graph/unit call history to fd; called from the crash
    handler, so it takes no locks. */

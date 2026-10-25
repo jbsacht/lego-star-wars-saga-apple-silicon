@@ -1,3 +1,5 @@
+#include <mach/mach_time.h>
+#include <CoreText/CoreText.h>
 #include "carbon_bridge.h"
 #include "focus_policy.h"
 #include "carbon_text.h"
@@ -16,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Carbon still supplies many 64-bit services, but its opaque references and
@@ -400,8 +403,16 @@ struct apple_handler_entry {
 static struct apple_handler_entry *apple_handlers;
 static int32_t event_handler(void *call, void *event, void *raw) {
   struct handler32 *h = raw;
+  UInt32 cls = GetEventClass(event), kind = GetEventKind(event);
+  if (cls == kEventClassApplication ||
+      (cls == kEventClassWindow && (kind == kEventWindowActivated || kind == kEventWindowDeactivated)))
+    fprintf(stderr, "compat32: Carbon focus event class=%08x kind=%u callback=%08x\n", cls, kind, h->callback);
   uint32_t a[] = {wrap(call), wrap(event), h->data};
-  return (int32_t)compat_runtime32_call(h->callback, a, 3);
+  bool deactivating = cls == kEventClassApplication && kind == kEventAppDeactivated;
+  if (deactivating) carbon_ui_begin_deactivation();
+  int32_t result = (int32_t)compat_runtime32_call(h->callback, a, 3);
+  if (deactivating) carbon_ui_end_deactivation();
+  return result;
 }
 /* Noncomposited Carbon controls use window-port coordinates. We create a
  * composited native window, whose HIViews instead use their parent's space. */
@@ -561,20 +572,25 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
     *out = query ? wrap(query(count ? ids : NULL, (int)count)) : 0;
     return 1;
   }
+  if (IS("_aglSetFullScreen")) {
+    *out = carbon_ui_gl_fullscreen(unwrap(a[0]));
+    return 1;
+  }
   if (IS("_aglSetDrawable")) {
-    uint8_t (*set)(void *, void *) = dlsym(agl, "aglSetWindowRef");
-    *out = set ? set(unwrap(a[0]), unwrap(a[1])) : 0;
-    if (*out && a[1]) {
-      carbon_ui_use_native(unwrap(a[1]));
-      place_test_window(unwrap(a[1]));
-    }
+    *out = carbon_ui_gl_attach(unwrap(a[0]), unwrap(a[1]));
     return 1;
   }
   if (IS("_aglGetDrawable")) {
-    void *(*get)(void *) = dlsym(agl, "aglGetWindowRef");
-    *out = get ? wrap(get(unwrap(a[0]))) : 0;
+    *out = wrap(carbon_ui_gl_window(unwrap(a[0])));
     return 1;
   }
+  if (IS("_aglSwapBuffers") && carbon_ui_gl_operation(unwrap(a[0]), 0)) {
+    *out = 0; return 1;
+  }
+  if (IS("_aglUpdateContext") && carbon_ui_gl_operation(unwrap(a[0]), 1)) {
+    *out = 1; return 1;
+  }
+  if (IS("_aglDestroyContext")) carbon_ui_gl_operation(unwrap(a[0]), 2);
   if (!function)
     return 0;
   if (IS("_aglGetCGLContext") || IS("_aglGetCGLPixelFormat")) {
@@ -626,6 +642,87 @@ static int agl_dispatch(const char *name, const uint32_t *a, uint64_t *out) {
 #undef P
 #undef F
 }
+struct legacy_measure_port { uint32_t token; struct legacy_measure_port *next; };
+static struct legacy_measure_port *legacy_measure_ports;
+static CFStringRef legacy_font_families[256];
+static pthread_mutex_t legacy_font_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local int16_t legacy_font_family;
+static _Thread_local int16_t legacy_font_size = 12;
+static _Thread_local uint8_t legacy_font_face;
+static CTFontRef legacy_current_font(void) {
+  pthread_mutex_lock(&legacy_font_lock);
+  CFStringRef family = legacy_font_family > 0 && legacy_font_family < 256
+      ? legacy_font_families[legacy_font_family] : NULL;
+  CTFontRef font = family ? CTFontCreateWithName(family, legacy_font_size, NULL)
+      : CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, legacy_font_size, NULL);
+  pthread_mutex_unlock(&legacy_font_lock);
+  CTFontSymbolicTraits traits = (legacy_font_face & 1 ? kCTFontBoldTrait : 0) |
+      (legacy_font_face & 2 ? kCTFontItalicTrait : 0);
+  if (traits && font) {
+    CTFontRef styled = CTFontCreateCopyWithSymbolicTraits(font, 0, NULL, traits, traits);
+    if (styled) { CFRelease(font); font = styled; }
+  }
+  return font;
+}
+/* Classic date seconds describe local wall-clock time since 1904. Keep the
+   guest's 32-bit seconds and packed short records separate from host longs. */
+static const double classic_epoch_offset = 3061152000.0;
+static CFCalendarRef classic_calendar(void) {
+  CFCalendarRef calendar = CFCalendarCreateWithIdentifier(NULL, kCFGregorianCalendar);
+  CFTimeZoneRef zone = CFTimeZoneCreateWithTimeIntervalFromGMT(NULL, 0);
+  CFCalendarSetTimeZone(calendar, zone);
+  CFRelease(zone);
+  return calendar;
+}
+static int64_t classic_date_seconds(const int16_t *date, bool long_record) {
+  const int16_t *d = date + (long_record ? 1 : 0);
+  CFCalendarRef calendar = classic_calendar();
+  CFAbsoluteTime absolute = 0;
+  CFCalendarComposeAbsoluteTime(calendar, &absolute, "GyMdHms",
+      long_record && date[0] ? 0 : 1, (int)d[0], (int)d[1], (int)d[2],
+      (int)d[3], (int)d[4], (int)d[5]);
+  CFRelease(calendar);
+  return (int64_t)(absolute + classic_epoch_offset);
+}
+static void classic_seconds_date(int64_t seconds, int16_t *date, bool long_record) {
+  CFCalendarRef calendar = classic_calendar();
+  int values[10] = {0};
+  CFCalendarDecomposeAbsoluteTime(calendar, seconds - classic_epoch_offset,
+      "GyMdHmsEDw", &values[0], &values[1], &values[2], &values[3], &values[4],
+      &values[5], &values[6], &values[7], &values[8], &values[9]);
+  CFRelease(calendar);
+  if (long_record) {
+    memset(date, 0, 28);
+    date[0] = values[0] == 1 ? 0 : 1;
+    for (unsigned i = 1; i < 10; ++i) date[i] = values[i];
+    date[10] = values[4] >= 12;
+  } else for (unsigned i = 0; i < 7; ++i) date[i] = values[i + 1];
+}
+static void classic_date_string(uint32_t seconds, bool time, unsigned form, unsigned char *text) {
+  CFLocaleRef locale = CFLocaleCopyCurrent();
+  CFDateFormatterStyle style = time ? (form ? kCFDateFormatterMediumStyle : kCFDateFormatterShortStyle) :
+      (form == 0 ? kCFDateFormatterShortStyle : form == 1 ? kCFDateFormatterLongStyle : kCFDateFormatterMediumStyle);
+  CFDateFormatterRef formatter = CFDateFormatterCreate(NULL, locale,
+      time ? kCFDateFormatterNoStyle : style, time ? style : kCFDateFormatterNoStyle);
+  CFTimeZoneRef zone = CFTimeZoneCreateWithTimeIntervalFromGMT(NULL, 0);
+  CFDateFormatterSetProperty(formatter, kCFDateFormatterTimeZone, zone);
+  CFStringRef result = CFDateFormatterCreateStringWithAbsoluteTime(NULL, formatter, seconds - classic_epoch_offset);
+  text[0] = 0;
+  if (result) {
+    /* Modern formatters use narrow no-break spaces, which the legacy
+       MacRoman Pascal string cannot encode. Normalize compatibility spaces. */
+    CFMutableStringRef normalized = CFStringCreateMutableCopy(NULL, 0, result);
+    CFStringNormalize(normalized, kCFStringNormalizationFormKC);
+    CFIndex used = 0;
+    CFStringGetBytes(normalized, CFRangeMake(0, CFStringGetLength(normalized)),
+        kCFStringEncodingMacRoman, '?', false, text + 1, 255, &used);
+    text[0] = (unsigned char)used;
+    CFRelease(normalized);
+    CFRelease(result);
+  }
+  CFRelease(zone); CFRelease(formatter); CFRelease(locale);
+}
+
 int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
                              uint64_t *out) {
 #define IS(s) (!strcmp(name, s))
@@ -640,6 +737,30 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   }
   if (agl_dispatch(name, a, out))
     return 1;
+  if (IS("_GetDateTime")) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    CFTimeZoneRef zone = CFTimeZoneCopyDefault();
+    if (a[0]) *(uint32_t *)P(0) = (uint32_t)(uint64_t)(now + classic_epoch_offset + CFTimeZoneGetSecondsFromGMT(zone, now));
+    CFRelease(zone); *out = 0; return 1;
+  }
+  if (IS("_SecondsToDate") || IS("_LongSecondsToDate")) {
+    int64_t seconds = a[0];
+    if (IS("_LongSecondsToDate")) memcpy(&seconds, P(0), 8);
+    if (a[1]) classic_seconds_date(seconds, P(1), IS("_LongSecondsToDate"));
+    *out = 0; return 1;
+  }
+  if (IS("_DateToSeconds") || IS("_LongDateToSeconds")) {
+    int64_t seconds = classic_date_seconds(P(0), IS("_LongDateToSeconds"));
+    if (a[1]) {
+      if (IS("_LongDateToSeconds")) memcpy(P(1), &seconds, 8);
+      else *(uint32_t *)P(1) = (uint32_t)seconds;
+    }
+    *out = 0; return 1;
+  }
+  if (IS("_DateString") || IS("_TimeString")) {
+    if (a[2]) classic_date_string(a[0], IS("_TimeString"), a[1], P(2));
+    *out = 0; return 1;
+  }
   if (IS("_ShowSheetWindow")) {
     *out = (uint32_t)carbon_ui_show_sheet(unwrap(a[0]), unwrap(a[1]));
     return 1;
@@ -681,7 +802,7 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       *(int32_t *)P(5) = (int32_t)end;
     return 1;
   }
-  if (name[0] != '_' || !strchr("FGIRQSCADTEMHPONUXY", name[1]))
+  if (name[0] != '_' || !strchr("KBLFGIRQSCADTEMHPONUXY", name[1]))
     return 0;
   if (getenv("LP32_TRACE_CARBON"))
     fprintf(stderr, "compat32: Carbon %s %#x %#x %#x %#x\n", name, a[0], a[1],
@@ -830,6 +951,26 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
             title ? title[0] : 0, title ? (const char *)title + 1 : "",
             message ? message[0] : 0, message ? (const char *)message + 1 : "");
     return 0;
+  }
+  if (IS("_CreateNewPort")) {
+    struct legacy_measure_port *port = calloc(1, sizeof(*port));
+    if (!port) { *out = 0; return 1; }
+    port->token = wrap(port); port->next = legacy_measure_ports;
+    legacy_measure_ports = port;
+    *out = port->token;
+    return 1;
+  }
+  if (IS("_DisposePort")) {
+    struct legacy_measure_port **slot = &legacy_measure_ports;
+    while (*slot && (*slot)->token != a[0]) slot = &(*slot)->next;
+    if (!*slot) return 0;
+    struct legacy_measure_port *port = *slot;
+    *slot = port->next;
+    struct carbon_ref *ref = reference(a[0]);
+    if (ref) ref->host = NULL;
+    if (current_port == a[0]) current_port = 0;
+    free(port); *out = 0;
+    return 1;
   }
   if (IS("_GetPort")) {
     if (a[0])
@@ -1317,7 +1458,7 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = 0;
     return 1;
   }
-  const char *native_name = name;
+  const char *native_name = IS("_BringToFront") ? "_SelectWindow" : name;
   if (IS("_CountSubControls")) {
     uint32_t count = 0;
     void *view =
@@ -1400,6 +1541,230 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
                                    &rect, &window);
     *(uint32_t *)P(5) = wrap(window);
     *out = (uint32_t)status;
+    return 1;
+  }
+  if (IS("_IsWindowCollapsable")) {
+    uint32_t attributes = 0;
+    int32_t status = ((int32_t (*)(void *, uint32_t *))symbol("_GetWindowAttributes"))(
+        unwrap(a[0]), &attributes);
+    *out = !status && (attributes & kWindowCollapseBoxAttribute) != 0;
+    return 1;
+  }
+  if (IS("_SetWindowContentColor")) {
+    const uint16_t *rgb = P(1);
+    if (!rgb || !unwrap(a[0])) { *out = (uint32_t)-50; return 1; }
+    carbon_ui_set_background(unwrap(a[0]), rgb[0], rgb[1], rgb[2]);
+    *out = 0;
+    return 1;
+  }
+  if (IS("_DisableScreenUpdates") || IS("_EnableScreenUpdates")) {
+    carbon_ui_screen_updates(IS("_EnableScreenUpdates"));
+    *out = 0;
+    return 1;
+  }
+  if (IS("_SetWindowResizeLimits") || IS("_GetWindowResizeLimits")) {
+    *out = carbon_ui_resize_limits(unwrap(a[0]), P(1), P(2),
+                                   IS("_SetWindowResizeLimits"));
+    return 1;
+  }
+  if (IS("_BringToFront") || IS("_SelectWindow")) {
+    carbon_ui_bring_front(unwrap(a[0]));
+    *out = 0;
+    return 1;
+  }
+  if (IS("_GetQDGlobalsDarkGray") || IS("_GetQDGlobalsGray") ||
+      IS("_GetQDGlobalsLightGray") || IS("_GetQDGlobalsBlack") ||
+      IS("_GetQDGlobalsWhite")) {
+    if (!a[0]) { *out = 0; return 1; }
+    uint8_t *pattern = P(0);
+    for (unsigned i = 0; i < 8; ++i) {
+      pattern[i] = IS("_GetQDGlobalsBlack") ? 255 : IS("_GetQDGlobalsWhite") ? 0 :
+          IS("_GetQDGlobalsDarkGray") ? (i % 2 ? 0xdd : 0x77) :
+          IS("_GetQDGlobalsLightGray") ? (i % 2 ? 0x22 : 0x88) :
+          (i % 2 ? 0x55 : 0xaa);
+    }
+    *out = a[0];
+    return 1;
+  }
+  if (IS("_GetThemeFont")) {
+    CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 0, NULL);
+    if (!font) { *out = (uint32_t)-50; return 1; }
+    CFStringRef family = CTFontCopyFamilyName(font);
+    if (a[2]) CFStringGetPascalString(family, P(2), 256, kCFStringEncodingMacRoman);
+    if (a[3]) *(int16_t *)P(3) = (int16_t)lround(CTFontGetSize(font));
+    if (a[4]) *(uint8_t *)P(4) = 0;
+    CFRelease(family); CFRelease(font);
+    *out = 0;
+    return 1;
+  }
+  if (IS("_FMGetFontFamilyFromName")) {
+    CFStringRef family = a[0] ? CFStringCreateWithPascalString(NULL, P(0),
+        kCFStringEncodingMacRoman) : NULL;
+    *out = 0;
+    if (!family) return 1;
+    pthread_mutex_lock(&legacy_font_lock);
+    for (unsigned i = 1; i < 256; ++i) {
+      if (!legacy_font_families[i]) legacy_font_families[i] = CFRetain(family);
+      if (CFEqual(legacy_font_families[i], family)) { *out = i; break; }
+    }
+    pthread_mutex_unlock(&legacy_font_lock);
+    CFRelease(family);
+    return 1;
+  }
+  if (IS("_TextFont") || IS("_TextSize") || IS("_TextFace") || IS("_UseThemeFont")) {
+    if (IS("_TextFont")) legacy_font_family = (int16_t)a[0];
+    if (IS("_TextSize")) legacy_font_size = (int16_t)a[0] > 0 ? (int16_t)a[0] : 12;
+    if (IS("_TextFace")) legacy_font_face = (uint8_t)a[0];
+    if (IS("_UseThemeFont")) { legacy_font_family = 0; legacy_font_size = 12; legacy_font_face = 0; }
+    *out = 0;
+    return 1;
+  }
+  if (IS("_GetFontInfo") || IS("_TextWidth")) {
+    CTFontRef font = legacy_current_font();
+    if (!font) return 0;
+    *out = 0;
+    if (IS("_GetFontInfo")) {
+      if (a[0]) {
+        int16_t *info = P(0);
+        info[0] = (int16_t)ceil(CTFontGetAscent(font));
+        info[1] = (int16_t)ceil(CTFontGetDescent(font));
+        info[2] = (int16_t)ceil(CTFontGetBoundingBox(font).size.width);
+        info[3] = (int16_t)ceil(CTFontGetLeading(font));
+      }
+    } else if (a[0] && (int16_t)a[1] >= 0 && (int16_t)a[2] > 0) {
+      CFStringRef text = CFStringCreateWithBytes(NULL, (uint8_t *)P(0) + (int16_t)a[1],
+          (int16_t)a[2], kCFStringEncodingMacRoman, false);
+      if (text) {
+        const void *keys[] = {kCTFontAttributeName}, *values[] = {font};
+        CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, values, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFAttributedStringRef attributed = CFAttributedStringCreate(NULL, text, attrs);
+        CTLineRef line = CTLineCreateWithAttributedString(attributed);
+        double width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+        *out = (uint32_t)(int16_t)fmin(32767, lround(width));
+        CFRelease(line); CFRelease(attributed); CFRelease(attrs); CFRelease(text);
+      }
+    }
+    CFRelease(font);
+    return 1;
+  }
+  if (IS("_UpTime") || IS("_AbsoluteToNanoseconds")) {
+    uint64_t ticks = IS("_UpTime") ? mach_absolute_time() :
+        ((uint64_t)a[1] << 32) | a[0];
+    if (IS("_AbsoluteToNanoseconds")) {
+      mach_timebase_info_data_t scale;
+      mach_timebase_info(&scale);
+      ticks = (uint64_t)((__uint128_t)ticks * scale.numer / scale.denom);
+    }
+    /* Intel UnsignedWide stores lo then hi, matching EDX:EAX. */
+    *out = ticks;
+    return 1;
+  }
+  if (IS("_GetGlobalMouse")) {
+    CGEventRef event = CGEventCreate(NULL);
+    CGPoint location = event ? CGEventGetLocation(event) : CGPointZero;
+    if (event) CFRelease(event);
+    if (a[0]) { Point *point = P(0); point->h = (int16_t)location.x; point->v = (int16_t)location.y; }
+    *out = 0;
+    return 1;
+  }
+  if (IS("_MoveWindow") || IS("_SizeWindow")) {
+    if (carbon_ui_game_geometry(unwrap(a[0]), (int16_t)a[1], (int16_t)a[2],
+                                IS("_SizeWindow"))) { *out = 0; return 1; }
+  }
+  if (IS("_GetPortBounds") || IS("_GetWindowPortBounds")) {
+    if (carbon_ui_game_bounds(unwrap(a[0]), P(1), 0)) { *out = a[1]; return 1; }
+    if (IS("_GetPortBounds")) {
+      if (a[1]) *(Rect *)P(1) = (Rect){0};
+      *out = a[1]; return 1;
+    }
+  }
+  if (IS("_GetWindowBounds") && carbon_ui_game_bounds(unwrap(a[0]), P(2), 1)) {
+    *out = 0; return 1;
+  }
+  if (IS("_ShowHide")) {
+    if (a[1]) carbon_ui_show(unwrap(a[0])); else carbon_ui_hide(unwrap(a[0]));
+    *out = 0; return 1;
+  }
+  if (IS("_LocalToGlobal") || IS("_GlobalToLocal")) {
+    Rect bounds = {0};
+    carbon_ui_game_bounds(unwrap(current_port), &bounds, 1);
+    if (a[0]) {
+      Point *point = P(0);
+      int direction = IS("_LocalToGlobal") ? 1 : -1;
+      point->h += direction * bounds.left; point->v += direction * bounds.top;
+    }
+    *out = 0; return 1;
+  }
+  if (IS("_IsWindowActive")) {
+    int active = carbon_ui_game_active(unwrap(a[0]));
+    if (active >= 0) { *out = active; return 1; }
+  }
+  if (IS("_ActiveNonFloatingWindow") || IS("_GetFrontWindowOfClass")) {
+    *out = wrap(carbon_ui_front_window()); return 1;
+  }
+  if (IS("_GetNextWindow")) {
+    *out = wrap(carbon_ui_next_window(unwrap(a[0]))); return 1;
+  }
+  if (IS("_KLGetCurrentKeyboardLayout")) {
+    static TISInputSourceRef layout;
+    if (!layout) layout = TISCopyCurrentKeyboardLayoutInputSource();
+    if (a[0]) *(uint32_t *)P(0) = wrap(layout);
+    *out = layout ? 0 : (uint32_t)-50; return 1;
+  }
+  if (IS("_KLGetKeyboardLayoutProperty")) {
+    TISInputSourceRef layout = unwrap(a[0]);
+    if (a[2]) *(uint32_t *)P(2) = 0;
+    if (a[1] == 1 && layout && a[2]) {
+      CFDataRef data = TISGetInputSourceProperty(layout, kTISPropertyUnicodeKeyLayoutData);
+      if (data) {
+        static CFDataRef cached;
+        static uint32_t storage;
+        if (data != cached) {
+          CFIndex length = CFDataGetLength(data);
+          uint32_t next = compat_runtime32_allocate(length, 0);
+          if (!next) { *out = (uint32_t)-108; return 1; }
+          memcpy((void *)(uintptr_t)next, CFDataGetBytePtr(data), length);
+          /* KL layout data is borrowed and may be retained by guest code. */
+          cached = CFRetain(data); storage = next;
+        }
+        *(uint32_t *)P(2) = storage;
+        *out = 0; return 1;
+      }
+    }
+    *out = (uint32_t)-50; return 1;
+  }
+  if (IS("_LMGetKbdType")) {
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    *out = source ? CGEventSourceGetKeyboardType(source) : 40;
+    if (source) CFRelease(source);
+    return 1;
+  }
+  if (IS("_UCKeyTranslate")) {
+    *out = (uint32_t)UCKeyTranslate(P(0), a[1], a[2], a[3], a[4], a[5],
+                                   P(6), a[7], P(8), P(9));
+    return 1;
+  }
+  /* These deprecated 32-bit APIs are CF ownership operations on WindowRef. */
+  if (IS("_RetainWindow") || IS("_ReleaseWindow") ||
+      IS("_GetWindowRetainCount")) {
+    CFTypeRef window = unwrap(a[0]);
+    if (!window) { *out = (uint32_t)-50; return 1; }
+    if (IS("_GetWindowRetainCount")) {
+      *out = (uint32_t)CFGetRetainCount(window);
+    } else if (IS("_RetainWindow")) {
+      CFRetain(window);
+      *out = 0;
+    } else {
+      if (CFGetRetainCount(window) == 1) {
+        carbon_ui_hide((void *)window);
+        carbon_ui_dispose((void *)window);
+        struct carbon_ref *ref = reference(a[0]);
+        if (ref) ref->host = NULL;
+      }
+      CFRelease(window);
+      *out = 0;
+    }
     return 1;
   }
   void *function = NULL;
@@ -1932,11 +2297,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     fprintf(stderr,
             "compat32: Carbon window class=%u attrs=%#x status=%d token=%#x\n",
             a[0], a[1], r, wrap(window));
+    if (!r && a[0] == 6) carbon_ui_game_prepare(window);
     *out = (uint32_t)r;
     return 1;
   }
   if (IS("_ShowWindow") || IS("_HideWindow") || IS("_DisposeWindow") ||
-      IS("_SelectWindow")) {
+      IS("_SelectWindow") || IS("_BringToFront")) {
     if (IS("_ShowWindow")) {
       place_test_window(unwrap(a[0]));
       carbon_ui_show(unwrap(a[0]));
@@ -1947,6 +2313,8 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       carbon_ui_hide(unwrap(a[0]));
     if (IS("_DisposeWindow"))
       carbon_ui_dispose(unwrap(a[0]));
+    if (IS("_HideWindow") || IS("_DisposeWindow"))
+      fprintf(stderr, "compat32: %s window=%08x caller=%08x\n", name, a[0], a[-1]);
     if (!IS("_SelectWindow") || !getenv("LP32_BACKGROUND_TEST"))
       F(void, void *)(unwrap(a[0]));
     *out = 0;
@@ -1963,6 +2331,12 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   if (IS("_GetWindowBounds") || IS("_SetWindowBounds")) {
     *out = (uint32_t)F(int32_t, void *, uint32_t, void *)(unwrap(a[0]), a[1],
                                                           P(2));
+    if (IS("_SetWindowBounds") && (int32_t)*out == noErr && a[2] && a[1] == 33) {
+      const Rect *bounds = P(2);
+      if (carbon_ui_game_geometry(unwrap(a[0]), bounds->right - bounds->left,
+                                  bounds->bottom - bounds->top, 1))
+        carbon_ui_game_geometry(unwrap(a[0]), bounds->left, bounds->top, 0);
+    }
     return 1;
   }
   if (IS("_GetWindowPortBounds")) {
@@ -1991,6 +2365,14 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = F(uint8_t, void *)(unwrap(a[0]));
     return 1;
   }
+  if (IS("_SetWindowContentColor")) {
+    *out = (uint32_t)F(int32_t, void *, const void *)(unwrap(a[0]), P(1));
+    return 1;
+  }
+  if (IS("_CollapseWindow")) {
+    *out = (uint32_t)F(int32_t, void *, uint8_t)(unwrap(a[0]), a[1] != 0);
+    return 1;
+  }
   if (IS("_SetWindowTitleWithCFString")) {
     *out = (uint32_t)F(int32_t, void *,
                        void *)(unwrap(a[0]), objc_bridge32_host_object(a[1]));
@@ -2012,25 +2394,6 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       bool)(unwrap(a[0]), (int16_t)a[1], (int16_t)a[2],
             a[3] != 0 && !getenv("LP32_BACKGROUND_TEST"));
     *out = 0;
-    return 1;
-  }
-  if (IS("_SetWindowResizeLimits") || IS("_GetWindowResizeLimits")) {
-    CGSize limits[2] = {{0, 0}, {0, 0}};
-    if (IS("_SetWindowResizeLimits"))
-      for (unsigned i = 0; i < 2; ++i)
-        if (a[i + 1]) {
-          float *p = (void *)(uintptr_t)a[i + 1];
-          limits[i] = CGSizeMake(p[0], p[1]);
-        }
-    *out = (uint32_t)F(int32_t, void *, CGSize *, CGSize *)(
-        unwrap(a[0]), a[1] ? &limits[0] : NULL, a[2] ? &limits[1] : NULL);
-    if (!*out && IS("_GetWindowResizeLimits"))
-      for (unsigned i = 0; i < 2; ++i)
-        if (a[i + 1]) {
-          float *p = (void *)(uintptr_t)a[i + 1];
-          p[0] = limits[i].width;
-          p[1] = limits[i].height;
-        }
     return 1;
   }
   if (IS("_RepositionWindow")) {
@@ -2270,6 +2633,8 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
       memset(P(0), 0, 16);
       for(unsigned key=0;key<128;++key)
         if(objc_bridge32_test_key_down(key))((unsigned char *)P(0))[key/8]|=1u<<(key%8);
+    } else if (carbon_ui_game_keys(P(0))) {
+      /* Cocoa owns the game window and its key-down/up state. */
     } else if (lp32_suppress_background_input()) {
       memset(P(0), 0, 16);
     } else
@@ -2280,6 +2645,9 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   if (IS("_UCConvertCFAbsoluteTimeToLongDateTime")) {
     double value;memcpy(&value,a,8);
     *out=(uint32_t)F(int32_t,double,int64_t *)(value,P(2));return 1;
+  }
+  if (IS("_ConvertLocalTimeToUTC")) {
+    *out = (uint32_t)F(int32_t, uint32_t, uint32_t *)(a[0], P(1)); return 1;
   }
   if (IS("_UCConvertLongDateTimeToCFAbsoluteTime")) {
     int64_t value;memcpy(&value,a,8);
@@ -2299,14 +2667,14 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
     *out = (uint32_t)F(int32_t, const void *, const void *, uint8_t *)(P(0), P(1), P(2));
     return 1;
   }
-  if (IS("_GetCurrentProcess") || IS("_GetFrontProcess") || IS("_GetProcessBundleLocation")) {
+  if (IS("_GetCurrentProcess") || IS("_GetFrontProcess") || IS("_GetNextProcess") || IS("_GetProcessBundleLocation")) {
     if (IS("_GetFrontProcess") && getenv("LP32_BACKGROUND_TEST") &&
         !getenv("LP32_TEST_FOCUS_LOSS")) {
       /* Match the simulated active state used by background rendering tests. */
       *out = (uint32_t)((int32_t (*)(void *))symbol("_GetCurrentProcess"))(P(0));
       return 1;
     }
-    if (IS("_GetCurrentProcess") || IS("_GetFrontProcess"))
+    if (IS("_GetCurrentProcess") || IS("_GetFrontProcess") || IS("_GetNextProcess"))
       *out = (uint32_t)F(int32_t, void *)(P(0));
     else
       *out = (uint32_t)F(int32_t, const void *, void *)(P(0), P(1));
@@ -2422,6 +2790,23 @@ int carbon_bridge32_dispatch(const char *name, const uint32_t *a,
   }
   if (IS("_FSCloseFork") || IS("_FSFlushFork")) {
     *out = (uint32_t)(int32_t)F(int16_t, int16_t)((int16_t)a[0]);
+    return 1;
+  }
+  if (IS("_FSAllocateFork")) {
+    int64_t offset = (int64_t)((uint64_t)a[3] | ((uint64_t)a[4] << 32));
+    uint64_t requested = (uint64_t)a[5] | ((uint64_t)a[6] << 32);
+    *out = (uint32_t)(int32_t)F(int16_t, int16_t, uint16_t, uint16_t,
+        int64_t, uint64_t, uint64_t *)((int16_t)a[0], (uint16_t)a[1],
+        (uint16_t)a[2], offset, requested, P(7));
+    return 1;
+  }
+  if (IS("_FSCreateFork")) {
+    *out = (uint32_t)(int32_t)F(int16_t, const void *, uint32_t, const void *)(P(0), a[1], P(2));
+    return 1;
+  }
+  if (IS("_FSRenameUnicode")) {
+    *out = (uint32_t)(int32_t)F(int16_t, const void *, uint32_t, const void *,
+        uint32_t, void *)(P(0), a[1], P(2), a[3], P(4));
     return 1;
   }
   if (IS("_FSReadFork") || IS("_FSWriteFork")) {
@@ -2817,14 +3202,197 @@ int carbon_bridge32_run_dispatch_self_test(void) {
   return 0;
 }
 
+int carbon_bridge32_run_save_self_test(void) {
+  char path[128] = "/tmp/lp32-save-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0) return -1;
+  close(fd);
+  uint32_t memory = compat_runtime32_allocate(2048, 1);
+  int result = -1;
+  int16_t fork = 0;
+  uint64_t out = 0;
+  const char *stage = "allocate guest memory";
+  if (!memory) goto done;
+  unsigned char *bytes = (void *)(uintptr_t)memory;
+  strcpy((char *)bytes + 400, path);
+  uint32_t args[8] = {memory + 400, memory, 0};
+  bool testing_timestamp = true;
+#define SAVE_CALL(name) do { \
+    stage = name; \
+    if (!carbon_bridge32_dispatch(name, args, &out) || (int32_t)out) goto done; \
+    if (testing_timestamp) { \
+      uint32_t callback = compat_runtime32_guest_callback(name); \
+      if (!callback || compat_runtime32_call(callback, args, 8)) goto done; \
+    } \
+  } while (0)
+  *(uint32_t *)(bytes + 1044) = 0x1234abcd;
+  args[0] = memory + 1040;
+  SAVE_CALL("_GetDateTime");
+  if (*(uint32_t *)(bytes + 1044) != 0x1234abcd) goto done;
+  uint32_t now = *(uint32_t *)(bytes + 1040);
+  time_t native_now = time(NULL); struct tm local;
+  localtime_r(&native_now, &local);
+  int64_t difference = (int64_t)now - (native_now + INT64_C(2082844800) + local.tm_gmtoff);
+  if (difference < -2 || difference > 2) goto done;
+  const uint32_t dates[] = {0, 1, now, 0xfffff000};
+  for (unsigned i = 0; i < sizeof(dates) / sizeof(dates[0]); ++i) {
+    *(int64_t *)(bytes + 1040) = dates[i];
+    args[0] = memory + 1040; args[1] = memory + 1072;
+    SAVE_CALL("_LongSecondsToDate");
+    int16_t *date = (void *)(bytes + 1072);
+    if ((i == 0 && (date[0] != 0 || date[1] != 1904 || date[2] != 1 || date[3] != 1 || date[7] != 6)) ||
+        (i == 2 && (date[1] != local.tm_year + 1900 || date[2] != local.tm_mon + 1 || date[3] != local.tm_mday))) goto done;
+    args[0] = memory + 1072; args[1] = memory + 1040;
+    SAVE_CALL("_LongDateToSeconds");
+    if (*(int64_t *)(bytes + 1040) != dates[i]) goto done;
+    args[0] = dates[i]; args[1] = memory + 1072;
+    SAVE_CALL("_SecondsToDate");
+    args[0] = memory + 1072; args[1] = memory + 1040;
+    SAVE_CALL("_DateToSeconds");
+    if (*(uint32_t *)(bytes + 1040) != dates[i]) goto done;
+  }
+  int16_t leap[] = {2000, 2, 29, 12, 34, 56, 3};
+  memcpy(bytes + 1072, leap, sizeof(leap));
+  args[0] = memory + 1072; args[1] = memory + 1040;
+  SAVE_CALL("_DateToSeconds");
+  args[0] = *(uint32_t *)(bytes + 1040); args[1] = memory + 1072;
+  SAVE_CALL("_SecondsToDate");
+  if (memcmp(bytes + 1072, leap, sizeof(leap))) goto done;
+  for (unsigned i = 0; i < 3; ++i) {
+    args[0] = now; args[1] = i; args[2] = memory + 1120; args[3] = 0;
+    SAVE_CALL("_DateString");
+    if (!bytes[1120]) goto done;
+    SAVE_CALL("_TimeString");
+    if (!bytes[1120]) goto done;
+  }
+  fprintf(stderr, "Save timestamp pipeline PASS (guest ABI, local epoch, packed records, leap day, round trips, date/time strings)\n");
+  testing_timestamp = false;
+  args[0] = memory + 400; args[1] = memory; args[2] = 0;
+  SAVE_CALL("_FSPathMakeRef");
+  args[0] = memory; args[1] = 0; args[2] = 0; args[3] = 3; args[4] = memory + 80;
+  SAVE_CALL("_FSOpenFork");
+  fork = *(int16_t *)(bytes + 80);
+  uint32_t allocation[] = {(uint32_t)fork, 4, 1, 0, 0, 128, 0, memory + 88};
+  memcpy(args, allocation, sizeof(args));
+  SAVE_CALL("_FSAllocateFork");
+  for (unsigned i = 0; i < 128; ++i) bytes[128 + i] = i ^ 0xa5;
+  uint32_t write_args[] = {(uint32_t)fork, 1, 0, 0, 128, memory + 128, memory + 84};
+  memcpy(args, write_args, sizeof(write_args));
+  SAVE_CALL("_FSWriteFork");
+  if (*(uint32_t *)(bytes + 84) != 128) goto done;
+  args[0] = fork;
+  SAVE_CALL("_FSFlushFork");
+  SAVE_CALL("_FSCloseFork"); fork = 0;
+  args[0] = memory; args[1] = 0; args[2] = 0; args[3] = 1; args[4] = memory + 80;
+  SAVE_CALL("_FSOpenFork");
+  fork = *(int16_t *)(bytes + 80);
+  uint32_t read_args[] = {(uint32_t)fork, 1, 0, 0, 128, memory + 256, memory + 84};
+  memcpy(args, read_args, sizeof(read_args));
+  SAVE_CALL("_FSReadFork");
+  if (*(uint32_t *)(bytes + 84) != 128 || memcmp(bytes + 128, bytes + 256, 128)) goto done;
+  args[0] = fork;
+  SAVE_CALL("_FSCloseFork"); fork = 0;
+  /* Exercise overwriting an existing slot after truncation, not only a new
+     file. A failed prior save leaves exactly such an empty existing file. */
+  args[0] = memory; args[1] = 0; args[2] = 0; args[3] = 3; args[4] = memory + 80;
+  SAVE_CALL("_FSOpenFork");
+  fork = *(int16_t *)(bytes + 80);
+  args[0] = fork; args[1] = 1; args[2] = args[3] = 0;
+  SAVE_CALL("_FSSetForkSize");
+  allocation[0] = fork; memcpy(args, allocation, sizeof(args));
+  SAVE_CALL("_FSAllocateFork");
+  for (unsigned i = 0; i < 128; ++i) bytes[128 + i] ^= 0x5a;
+  write_args[0] = fork; memcpy(args, write_args, sizeof(write_args));
+  SAVE_CALL("_FSWriteFork");
+  args[0] = fork;
+  SAVE_CALL("_FSCloseFork"); fork = 0;
+  args[0] = memory; args[1] = 0; args[2] = 0; args[3] = 1; args[4] = memory + 80;
+  SAVE_CALL("_FSOpenFork");
+  fork = *(int16_t *)(bytes + 80);
+  read_args[0] = fork; memcpy(args, read_args, sizeof(read_args));
+  SAVE_CALL("_FSReadFork");
+  if (*(uint32_t *)(bytes + 84) != 128 || memcmp(bytes + 128, bytes + 256, 128)) goto done;
+  args[0] = fork;
+  SAVE_CALL("_FSCloseFork"); fork = 0;
+  char name[128]; snprintf(name, sizeof(name), "%s-saved", strrchr(path, '/') + 1);
+  UniChar *unicode = (void *)(bytes + 640);
+  for (unsigned i = 0; i < strlen(name); ++i) unicode[i] = name[i];
+  args[0] = memory; args[1] = strlen(name); args[2] = memory + 640;
+  args[3] = 0xffff; args[4] = memory + 512;
+  SAVE_CALL("_FSRenameUnicode");
+  strcat(path, "-saved");
+  struct stat status;
+  if (stat(path, &status) || status.st_size != 128) goto done;
+  result = 0;
+done:
+  if (fork) { uint32_t close_args[] = {(uint32_t)fork}; carbon_bridge32_dispatch("_FSCloseFork", close_args, &out); }
+  if (memory) compat_runtime32_deallocate(memory);
+  unlink(path);
+  fprintf(stderr, "Carbon save lifecycle %s (allocate, write, flush, close, reopen, read, overwrite, rename; stage=%s status=%d)\n",
+      result ? "FAIL" : "PASS", stage, (int32_t)out);
+  return result;
+#undef SAVE_CALL
+}
+
 /* Uses hidden native windows to verify the guest coordinate contract. */
 int carbon_bridge32_run_geometry_self_test(void) {
   uint32_t memory = compat_runtime32_allocate(128, 1);
   if (!memory)
     return -1;
+  uint32_t font_args[8] = {memory};
+  uint64_t family = 0, width12 = 0, width24 = 0;
+  memcpy((void *)(uintptr_t)memory, "\011Helvetica", 10);
+  if (!carbon_bridge32_dispatch("_FMGetFontFamilyFromName", font_args, &family) || !family)
+    return -1;
+  font_args[0] = (uint32_t)family;
+  carbon_bridge32_dispatch("_TextFont", font_args, &width12);
+  font_args[0] = 12;
+  carbon_bridge32_dispatch("_TextSize", font_args, &width12);
+  font_args[0] = memory; font_args[1] = 1; font_args[2] = 9;
+  if (!carbon_bridge32_dispatch("_TextWidth", font_args, &width12) || !width12) return -1;
+  font_args[0] = 24;
+  carbon_bridge32_dispatch("_TextSize", font_args, &width24);
+  font_args[0] = memory;
+  if (!carbon_bridge32_dispatch("_TextWidth", font_args, &width24) || width24 <= width12)
+    return -1;
+  font_args[0] = memory + 16;
+  if (!carbon_bridge32_dispatch("_GetFontInfo", font_args, &family) ||
+      *(int16_t *)(uintptr_t)(memory + 16) <= 0) return -1;
+  font_args[0] = 12;
+  carbon_bridge32_dispatch("_TextSize", font_args, &family);
+  fprintf(stderr, "Legacy font lookup/metrics PASS (12px=%llu, 24px=%llu)\n",
+          (unsigned long long)width12, (unsigned long long)width24);
+  uint64_t ticks = 0, nanoseconds = 0;
+  uint32_t clock_args[2] = {0};
+  if (!carbon_bridge32_dispatch("_UpTime", clock_args, &ticks)) return -1;
+  clock_args[0] = (uint32_t)ticks; clock_args[1] = (uint32_t)(ticks >> 32);
+  if (!carbon_bridge32_dispatch("_AbsoluteToNanoseconds", clock_args, &nanoseconds)) return -1;
+  mach_timebase_info_data_t scale; mach_timebase_info(&scale);
+  uint64_t expected = (uint64_t)((__uint128_t)ticks * scale.numer / scale.denom);
+  if (nanoseconds != expected || ticks > mach_absolute_time()) return -1;
+  fprintf(stderr, "Legacy clock ABI PASS (Intel word order)\n");
   Rect *rect = (void *)(uintptr_t)memory;
   uint32_t *handles = (void *)(uintptr_t)(memory + 64);
   int result = -1;
+  {
+    /* Saga creates a zero-size game window before setting its content rect.
+       That window has no NSScreen yet; its first resize must still work. */
+    uint64_t out = 0;
+    *rect = (Rect){200, 100, 200, 100};
+    uint32_t args[8] = {6, kWindowCompositingAttribute, memory, memory + 64};
+    if (!carbon_bridge32_dispatch("_CreateNewWindow", args, &out) || out) goto done;
+    uint32_t game_window = handles[0];
+    *rect = (Rect){200, 100, 680, 740};
+    args[0] = game_window; args[1] = 33; args[2] = memory;
+    bool valid = carbon_bridge32_dispatch("_SetWindowBounds", args, &out) && !out;
+    memset(rect, 0, sizeof(*rect));
+    args[1] = memory;
+    valid = valid && carbon_bridge32_dispatch("_GetWindowPortBounds", args, &out) &&
+        rect->left == 0 && rect->top == 0 && rect->right == 640 && rect->bottom == 480;
+    carbon_bridge32_dispatch("_DisposeWindow", args, &out);
+    if (!valid) goto done;
+    fprintf(stderr, "Cocoa game window initial resize PASS (zero-size window to 640x480)\n");
+  }
   for (unsigned composited = 0; composited < 2; ++composited) {
     uint64_t out = 0;
     uint32_t args[8] = {0};
@@ -2911,10 +3479,19 @@ int carbon_bridge32_run_geometry_self_test(void) {
       ReleaseEvent(event);
     if (!event_ok)
       goto dispose;
+    args[0] = handles[0];
+    uint64_t initial_count = 0;
+    if (!carbon_bridge32_dispatch("_GetWindowRetainCount", args, &initial_count) ||
+        !carbon_bridge32_dispatch("_RetainWindow", args, &out) || out ||
+        !carbon_bridge32_dispatch("_GetWindowRetainCount", args, &out) ||
+        out != initial_count + 1 ||
+        !carbon_bridge32_dispatch("_ReleaseWindow", args, &out) || out ||
+        !carbon_bridge32_dispatch("_GetWindowRetainCount", args, &out) ||
+        out != initial_count) goto dispose;
     result = 0;
   dispose:
     args[0] = handles[0];
-    carbon_bridge32_dispatch("_DisposeWindow", args, &out);
+    carbon_bridge32_dispatch("_ReleaseWindow", args, &out);
     if (result)
       goto done;
     if (!composited)

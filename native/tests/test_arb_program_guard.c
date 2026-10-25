@@ -15,6 +15,7 @@ int main(void)
 {
     static const char source[] =
         "!!ARBfp1.0\n"
+        "\n# generated shader\n\t\r\n"
         "OPTION ARB_draw_buffers;\n"
         "TEMP R0;\n"
         "RSQ R0.x, R0.y;\n"

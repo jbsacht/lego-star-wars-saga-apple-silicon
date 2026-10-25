@@ -17,6 +17,7 @@
   AVPlayer *player;
   AVPlayerItemVideoOutput *output;
   AVAsset *asset;
+  NSMutableDictionary *sample_times;
   Rect bounds;
   uint32_t world, callback, callback_data;
   BOOL started;
@@ -28,6 +29,7 @@
   [player release];
   [output release];
   [asset release];
+  [sample_times release];
   [super dealloc];
 }
 @end
@@ -74,7 +76,36 @@ static struct world32 *worlds;
 static uint32_t next_world = 0x75000000;
 static NSMutableDictionary *movies, *movie_files;
 static uint32_t next_movie = 0x75100000;
+struct movie_callback {
+  uint32_t token, movie, function, refcon, flags;
+  int32_t type, value, scale;
+  BOOL armed, disposed;
+  struct movie_callback *next;
+};
+static struct movie_callback *movie_callbacks;
+static uint32_t next_movie_callback = 0x75700000;
+static struct movie_callback *movie_callback(uint32_t token) {
+  for (struct movie_callback *p = movie_callbacks; p; p = p->next)
+    if (p->token == token && !p->disposed) return p;
+  return NULL;
+}
 static uint16_t next_file = 1;
+static NSMutableDictionary *pointer_handlers;
+static uint32_t next_pointer_handler = 0x75410000;
+static NSData *copy_guest_handle(uint32_t handle) {
+  if (!handle) return nil;
+  uint32_t args[] = {handle}; uint64_t size = 0;
+  if (!resource_bridge32_dispatch("_GetHandleSize", args, &size) || size > 1048576) return nil;
+  uint32_t data = *(uint32_t *)(uintptr_t)handle;
+  return data ? [NSData dataWithBytes:(void *)(uintptr_t)data length:size] : nil;
+}
+static uint32_t make_guest_handle(NSData *data) {
+  uint32_t args[] = {(uint32_t)[data length]}; uint64_t handle = 0;
+  if (!data || !resource_bridge32_dispatch("_NewHandle", args, &handle) || !handle) return 0;
+  memcpy((void *)(uintptr_t)*(uint32_t *)(uintptr_t)handle, [data bytes], [data length]);
+  return (uint32_t)handle;
+}
+
 static LP32Movie *movie(uint32_t token) {
   return [movies objectForKey:@(token)];
 }
@@ -83,6 +114,41 @@ static struct world32 *world(uint32_t token) {
     if (p->token == token)
       return p;
   return NULL;
+}
+static NSArray *movie_sample_times(LP32Movie *m, uint32_t type) {
+  if (!m->sample_times) m->sample_times = [[NSMutableDictionary alloc] init];
+  NSArray *cached = m->sample_times[@(type)];
+  if (cached) return cached;
+  NSString *mediaType = type == 0x76696465 ? AVMediaTypeVideo :
+      type == 0x736f756e ? AVMediaTypeAudio : nil;
+  NSMutableArray *samples = [NSMutableArray array];
+  for (AVAssetTrack *track in mediaType ? [m->asset tracksWithMediaType:mediaType] : @[]) {
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:m->asset error:NULL];
+    AVAssetReaderTrackOutput *output = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:nil];
+    if (![reader canAddOutput:output]) continue;
+    [reader addOutput:output];
+    if (![reader startReading]) continue;
+    CMSampleBufferRef sample;
+    while ((sample = [output copyNextSampleBuffer])) {
+      CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
+      CMTime duration = CMSampleBufferGetDuration(sample);
+      if (CMTIME_IS_NUMERIC(pts)) {
+        int64_t time = CMTimeConvertScale(pts, 600, kCMTimeRoundingMethod_Default).value;
+        int64_t length = CMTIME_IS_NUMERIC(duration) ?
+            CMTimeConvertScale(duration, 600, kCMTimeRoundingMethod_Default).value : 0;
+        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
+        BOOL sync = YES;
+        if (attachments && CFArrayGetCount(attachments))
+          sync = CFDictionaryGetValue(CFArrayGetValueAtIndex(attachments, 0), kCMSampleAttachmentKey_NotSync) != kCFBooleanTrue;
+        [samples addObject:@[@(time), @(MAX(length, 1)), @(sync)]];
+      }
+      CFRelease(sample);
+    }
+  }
+  [samples sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) { return [a[0] compare:b[0]]; }];
+  m->sample_times[@(type)] = samples;
+  fprintf(stderr, "compat32: indexed QuickTime media type=%08x samples=%lu\n", type, (unsigned long)samples.count);
+  return samples;
 }
 static uint32_t new_movie(NSString *path) {
   LP32Movie *m = [[LP32Movie alloc] init];
@@ -116,6 +182,28 @@ static uint32_t new_movie(NSString *path) {
 }
 static void movie_task(uint32_t token) {
   LP32Movie *m = movie(token);
+  if (m && m->started) {
+    double now = CMTimeGetSeconds(m->player.currentTime);
+    double end = CMTimeGetSeconds(m->asset.duration);
+    BOOL failed = m->player.status == AVPlayerStatusFailed;
+    for (struct movie_callback *p = movie_callbacks; p; p = p->next) {
+      if (p->disposed || !p->armed || p->movie != token) continue;
+      BOOL due = p->type == 4 ?
+          (((p->flags & 2) && (failed || (isfinite(end) && now >= end))) ||
+           ((p->flags & 1) && isfinite(now) && now <= 0)) :
+          (p->type == 1 && p->scale > 0 && (p->flags & 1) &&
+           isfinite(now) && now >= (double)p->value / p->scale);
+      if (due) {
+        uint32_t args[] = {p->token, p->refcon};
+        uint32_t function = p->function;
+        p->armed = NO;
+        fprintf(stderr, "compat32: QuickTime callback fired movie=%08x type=%d failed=%d\n", token, p->type, failed);
+        compat_runtime32_call(function, args, 2);
+      }
+    }
+    /* An end callback may have disposed or replaced the movie. */
+    m = movie(token);
+  }
   struct world32 *w = m ? world(m->world) : NULL;
   if (!m || !w || !m->output)
     return;
@@ -133,10 +221,19 @@ static void movie_task(uint32_t token) {
          stride = CVPixelBufferGetBytesPerRow(frame);
   size_t dw = (uint16_t)(w->bounds.right - w->bounds.left),
          dh = (uint16_t)(w->bounds.bottom - w->bounds.top);
-  if (width && height && dw && dh && w->stride >= dw * 4) {
+  BOOL yuv = w->format == kCVPixelFormatType_422YpCbCr8;
+  if (width && height && dw && dh && w->stride >= dw * (yuv ? 2 : 4) &&
+      (!yuv || (CVPixelBufferGetPixelFormatType(frame) == kCVPixelFormatType_422YpCbCr8 && !(dw & 1)))) {
     for (size_t y = 0; y < dh; ++y) {
       unsigned char *dest = (void *)(uintptr_t)(w->pixels + y * w->stride);
       const unsigned char *row = source + (y * height / dh) * stride;
+      if (yuv) {
+        for (size_t x = 0; x < dw; x += 2) {
+          size_t sx = (x * width / dw) & ~(size_t)1;
+          memcpy(dest + x * 2, row + sx * 2, 4);
+        }
+        continue;
+      }
       for (size_t x = 0; x < dw; ++x) {
         const unsigned char *p = row + (x * width / dw) * 4;
         if (w->format == k32BGRAPixelFormat)
@@ -231,6 +328,29 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
   if (name[0] != '_' || !strchr("CEGMNODQISLURPFB", name[1]))
     return 0;
   @autoreleasepool {
+    if (IS("_NewCallBack")) {
+      int type = a[1] & 0x7fff;
+      if (!movie(a[0]) || (type != 1 && type != 4)) { *out = 0; return 1; }
+      struct movie_callback *p = calloc(1, sizeof(*p));
+      if (!p) { *out = 0; return 1; }
+      p->token = next_movie_callback; next_movie_callback += 16;
+      p->movie = a[0]; p->type = type;
+      p->next = movie_callbacks; movie_callbacks = p;
+      *out = p->token; return 1;
+    }
+    if (IS("_CallMeWhen") || IS("_DisposeCallBack") || IS("_CancelCallBack")) {
+      struct movie_callback *p = movie_callback(a[0]);
+      if (!p) { *out = (uint32_t)-50; return 1; }
+      if (IS("_CallMeWhen")) {
+        p->function = a[1]; p->refcon = a[2]; p->flags = a[3];
+        p->value = a[4]; p->scale = a[5]; p->armed = a[1] != 0;
+        fprintf(stderr, "compat32: QuickTime callback armed movie=%08x type=%d flags=%u\n", p->movie, p->type, p->flags);
+      } else {
+        p->armed = NO;
+        if (IS("_DisposeCallBack")) p->disposed = YES;
+      }
+      *out = 0; return 1;
+    }
     struct world32 *current = world(current_world);
     if (current && IS("_ClipRect")) {
       current->clip = *(Rect *)P(0);
@@ -317,7 +437,7 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       return 1;
     }
     if (IS("_GetPixelsState") || IS("_SetPixelsState") || IS("_LockPixels") ||
-        IS("_UnlockPixels") || IS("_GetPixBaseAddr")) {
+        IS("_UnlockPixels") || IS("_GetPixBaseAddr") || IS("_GetPixRowBytes")) {
       struct world32 *w = worlds;
       while (w && w->pixmap != a[0])
         w = w->next;
@@ -327,6 +447,8 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
         *out = w->pixel_state;
       else if (IS("_GetPixBaseAddr"))
         *out = w->pixels;
+      else if (IS("_GetPixRowBytes"))
+        *out = w->stride;
       else if (IS("_LockPixels")) {
         w->pixel_state |= 0x80;
         *out = 1;
@@ -337,6 +459,31 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
           w->pixel_state &= ~0x80u;
         *out = 0;
       }
+      return 1;
+    }
+    if (IS("_GetGraphicsImporterForDataRef")) {
+      NSData *ref = copy_guest_handle(a[0]);
+      uint32_t token = 0;
+      if (a[1] == 0x70747220 && [ref length] >= 8) {
+        const uint32_t *record = [ref bytes];
+        if (record[0] && record[1] && record[1] < 536870912) {
+          LP32GraphicsImporter *image = [[LP32GraphicsImporter alloc] init];
+          NSData *data = [NSData dataWithBytes:(void *)(uintptr_t)record[0] length:record[1]];
+          image->source = CGImageSourceCreateWithData((CFDataRef)data, NULL);
+          if (image->source && select_image(image, 0)) {
+            image->matrix[0] = image->matrix[4] = 1 << 16;
+            image->matrix[8] = 1 << 30;
+            if (!graphics_importers) graphics_importers = [[NSMutableDictionary alloc] init];
+            token = next_importer; next_importer += 16;
+            [graphics_importers setObject:image forKey:@(token)];
+            fprintf(stderr, "compat32: imported pointer-backed image %dx%d\n",
+                image->bounds.right, image->bounds.bottom);
+          }
+          [image release];
+        }
+      }
+      if (a[2]) *(uint32_t *)P(2) = token;
+      *out = token ? 0 : (uint32_t)-2048;
       return 1;
     }
     if (IS("_GetGraphicsImporterForFile")) {
@@ -467,8 +614,6 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
           *out = (uint32_t)-50;
           return 1;
         }
-        CGContextTranslateCTM(context, 0, height);
-        CGContextScaleCTM(context, 1, -1);
         Rect clip = w->clip;
         CGContextClipToRect(context,
                             CGRectMake(clip.left - w->bounds.left,
@@ -503,6 +648,66 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       if (a[1])
         *(uint32_t *)P(1) = 0;
       *out = 0;
+      return 1;
+    }
+    if (IS("_OpenADataHandler")) {
+      NSData *ref = copy_guest_handle(a[0]);
+      if (a[1] != 0x70747220 || [ref length] < 8 || !a[6]) { *out = (uint32_t)-50; return 1; }
+      if (!pointer_handlers) pointer_handlers = [[NSMutableDictionary alloc] init];
+      uint32_t token = next_pointer_handler++;
+      [pointer_handlers setObject:ref forKey:@(token)];
+      *(uint32_t *)P(6) = token;
+      *out = 0; return 1;
+    }
+    NSData *pointer_ref = [pointer_handlers objectForKey:@(a[0])];
+    if (pointer_ref && IS("_DataHSetDataRefExtension")) {
+      /* Type/name hints are unnecessary for AVFoundation content sniffing. */
+      *out = 0; return 1;
+    }
+    if (pointer_ref && IS("_DataHGetDataRef")) {
+      uint32_t handle = make_guest_handle(pointer_ref);
+      if (a[1]) *(uint32_t *)P(1) = handle;
+      *out = handle ? 0 : (uint32_t)-108; return 1;
+    }
+    if (pointer_ref && IS("_CloseComponent")) {
+      [pointer_handlers removeObjectForKey:@(a[0])]; *out = 0; return 1;
+    }
+    if (IS("_FindNextComponent") && a[1]) {
+      const uint32_t *description = P(1);
+      fprintf(stderr, "compat32: component search type=%#x subtype=%#x manufacturer=%#x\n",
+          description[0], description[1], description[2]);
+    }
+    if (IS("_FindNextComponent") && a[1] && *(uint32_t *)P(1) == 0x65617420) {
+      *out = a[0] ? 0 : 0x75400000; return 1;
+    }
+    if ((IS("_OpenComponent") && a[0] == 0x75400000) ||
+        (IS("_OpenDefaultComponent") && a[0] == 0x65617420)) {
+      *out = 0x75400000; return 1;
+    }
+    if (IS("_CallComponentVersion") && a[0] == 0x75400000) { *out = 0x07000000; return 1; }
+    if (IS("_CloseComponent") && a[0] == 0x75400000) { *out = 0; return 1; }
+    if (IS("_MovieImportDataRef") && a[0] == 0x75400000) {
+      NSData *ref = copy_guest_handle(a[1]);
+      uint32_t token = 0;
+      if (a[2] == 0x70747220 && [ref length] >= 8) {
+        const uint32_t *record = [ref bytes];
+        if (record[0] && record[1] && record[1] < 536870912) {
+          NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:
+              [NSString stringWithFormat:@"lp32-movie-%@.mov", [[NSUUID UUID] UUIDString]]];
+          NSData *media = [NSData dataWithBytes:(void *)(uintptr_t)record[0] length:record[1]];
+          if ([media writeToFile:path atomically:YES]) token = new_movie(path);
+          if (token) {
+            LP32Movie *loaded = movie(token);
+            [movies setObject:loaded forKey:@(a[3])];
+            [movies removeObjectForKey:@(token)];
+            if (a[7]) *(int32_t *)P(7) = (int32_t)(CMTimeGetSeconds(loaded->asset.duration) * 600);
+            if (a[9]) *(uint32_t *)P(9) = 64;
+            if (a[5]) *(uint32_t *)P(5) = 0;
+            fprintf(stderr, "compat32: imported pointer-backed QuickTime movie (%u bytes)\n", record[1]);
+          } else [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
+        }
+      }
+      *out = token ? 0 : (uint32_t)-2048;
       return 1;
     }
     if (IS("_EnterMovies") || IS("_ExitMovies")) {
@@ -546,12 +751,15 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       return 1;
     }
     if (IS("_DisposeMovie")) {
+      for (struct movie_callback *p = movie_callbacks; p; p = p->next)
+        if (p->movie == a[0]) { p->armed = NO; p->disposed = YES; }
       [movies removeObjectForKey:@(a[0])];
       *out = 0;
       return 1;
     }
     if (IS("_MoviesTask")) {
-      movie_task(a[0]);
+      if (a[0]) movie_task(a[0]);
+      else for (NSNumber *key in [[[movies allKeys] copy] autorelease]) movie_task(key.unsignedIntValue);
       *out = 0;
       return 1;
     }
@@ -565,9 +773,11 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       Rect bounds = *(Rect *)P(2);
       int width = bounds.right - bounds.left,
           height = bounds.bottom - bounds.top;
+      BOOL yuv = a[1] == kCVPixelFormatType_422YpCbCr8;
       if ((a[1] != 32 && a[1] != k32ARGBPixelFormat &&
-           a[1] != k32BGRAPixelFormat && a[1] != k32RGBAPixelFormat) ||
-          width <= 0 || height <= 0 || a[7] < (uint32_t)width * 4 ||
+           a[1] != k32BGRAPixelFormat && a[1] != k32RGBAPixelFormat && !yuv) ||
+          width <= 0 || height <= 0 || (yuv && (width & 1)) ||
+          a[7] < (uint32_t)width * (yuv ? 2 : 4) ||
           (uint64_t)a[6] + (uint64_t)a[7] * height > UINT32_MAX) {
         *out = (uint32_t)-50;
         return 1;
@@ -600,7 +810,7 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       uint16_t rowbytes = (uint16_t)(0x8000 | (w->stride & 0x3fff));
       memcpy(p + 4, &rowbytes, 2);
       memcpy(p + 6, &w->bounds, 8);
-      uint16_t pixel[4] = {16, 32, 3, 8};
+      uint16_t pixel[4] = {16, yuv ? 16 : 32, 3, 8};
       memcpy(p + 30, pixel, 8);
       memcpy(p + 38, &w->format, 4);
       w->next = worlds;
@@ -647,13 +857,56 @@ int quicktime_bridge32_dispatch(const char *name, const uint32_t *a,
       *out = 0;
       return 1;
     }
+    if (IS("_GetMovieNextInterestingTime")) {
+      int64_t best = -1, duration = 0;
+      BOOL backward = (int32_t)a[5] < 0, edge = (a[1] & 0x4000) != 0;
+      int32_t origin = a[4];
+      const uint32_t *types = P(3);
+      for (unsigned i = 0; types && i < MIN(a[2], 32u); ++i) {
+        for (NSArray *sample in movie_sample_times(m, types[i])) {
+          int64_t time = [sample[0] longLongValue];
+          if ((a[1] & 8) && ![sample[2] boolValue]) continue;
+          BOOL eligible = backward ? (time < origin || (edge && time == origin)) :
+                                      (time > origin || (edge && time == origin));
+          if (eligible && (best < 0 || (backward ? time > best : time < best))) {
+            best = time; duration = [sample[1] longLongValue];
+          }
+        }
+      }
+      if (a[6]) *(int32_t *)P(6) = (int32_t)best;
+      if (a[7]) *(int32_t *)P(7) = (int32_t)duration;
+      *out = 0; return 1;
+    }
     if (IS("_SetMovieBox")) {
       m->bounds = *(Rect *)P(1);
       *out = 0;
       return 1;
     }
+    if (IS("_SetMovieLanguage")) {
+      CFStringRef localeID = CFLocaleCreateCanonicalLocaleIdentifierFromScriptManagerCodes(
+          kCFAllocatorDefault, (LangCode)a[1], 0);
+      if (localeID) {
+        NSLocale *locale = [[[NSLocale alloc] initWithLocaleIdentifier:(NSString *)localeID] autorelease];
+        AVMediaSelectionGroup *group = [m->asset mediaSelectionGroupForMediaCharacteristic:AVMediaCharacteristicAudible];
+        NSArray *options = group ? [AVMediaSelectionGroup mediaSelectionOptionsFromArray:group.options withLocale:locale] : nil;
+        if (options.count) [[m->player currentItem] selectMediaOption:options[0] inMediaSelectionGroup:group];
+        CFRelease(localeID);
+      }
+      *out = 0; return 1;
+    }
     if (IS("_SetMovieGWorld")) {
       m->world = a[1];
+      struct world32 *w = world(a[1]);
+      if (w && m->player) {
+        uint32_t format = w->format == kCVPixelFormatType_422YpCbCr8 ?
+            kCVPixelFormatType_422YpCbCr8 : kCVPixelFormatType_32BGRA;
+        AVPlayerItem *item = m->player.currentItem;
+        if (m->output) { [item removeOutput:m->output]; [m->output release]; }
+        m->output = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:
+            @{(id)kCVPixelBufferPixelFormatTypeKey:@(format)}];
+        [item addOutput:m->output];
+        fprintf(stderr, "compat32: QuickTime movie output format=%08x world=%08x\n", format, w->token);
+      }
       *out = 0;
       return 1;
     }

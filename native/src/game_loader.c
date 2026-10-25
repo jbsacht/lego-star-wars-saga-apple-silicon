@@ -1226,8 +1226,23 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_AUDIO_CALLBACK_SELFTEST")) {
+        int result = audio_bridge32_run_callback_replacement_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_AUDIO_CONVERTER_SELFTEST")) {
+        int result = audio_bridge32_run_converter_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_FILE_SELFTEST")) {
         int result = compat_runtime32_run_file_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_CARBON_SAVE_SELFTEST")) {
+        int result = carbon_bridge32_run_save_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
@@ -1248,6 +1263,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_SYNC_SELFTEST")) {
         int result = compat_runtime32_run_sync_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_SECURITY_SELFTEST")) {
+        int result = objc_bridge32_run_security_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

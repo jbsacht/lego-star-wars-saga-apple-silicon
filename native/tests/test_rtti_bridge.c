@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <time.h>
 static uint32_t next = 0x10000000;
 static uint32_t alloc(unsigned n) {
   uint32_t p = next;
@@ -100,6 +101,23 @@ int main(void) {
   vptr(obj + 16, Repeated, 16, 16);
   vptr(obj + 32, Repeated, 32, 0);
   assert(!rtti_bridge32_cast(obj + 32, A, V)); /* two enclosing V objects */
+  /* Game images contain thousands of unrelated RTTI records. Preserve the
+     same virtual-diamond result with hot records near the end of that list. */
+  unsigned original_count = type_count;
+  memmove(types + 3000, types, original_count * sizeof(types[0]));
+  for (unsigned i = 0; i < 3000; ++i) {
+    types[i].address = 0x18000000 + i * 16;
+    types[i].kind = 1;
+  }
+  type_count += 3000;
+  vptr(obj, Diamond, 0, 32);
+  vptr(obj + 16, Diamond, 16, 16);
+  vptr(obj + 32, Diamond, 32, 0);
+  uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  for (unsigned i = 0; i < 25000; ++i)
+    assert(rtti_bridge32_cast(obj + 32, A, W) == obj + 16);
+  printf("RTTI 3000-type virtual-crosscast benchmark: %.1f ns/call\n",
+      (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start) / 25000.0);
   puts("RTTI bridge PASS (downcast, crosscast, private, ambiguous, virtual "
        "diamond and null)");
 }

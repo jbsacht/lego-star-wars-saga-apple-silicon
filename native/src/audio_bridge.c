@@ -55,8 +55,11 @@ struct audio_callback_context {
     AUGraph owner_graph;
     AUNode callback_node;
     UInt32 callback_bus;
+    AudioUnit callback_unit;
+    UInt32 callback_scope;
     bool in_use;
     bool callback_attached;
+    bool retire_after_response;
     /* Set when the guest has stopped or disposed the owning graph but the
        host teardown is still pending; the callback then renders silence
        without entering guest code. */
@@ -438,6 +441,8 @@ static void refresh_audio_worker_workgroup(struct audio_worker_workgroup *state)
     }
 }
 
+static _Thread_local struct audio_callback_context *current_audio_callback;
+
 static void *audio_callback_worker(void *opaque)
 {
     (void)opaque;
@@ -465,9 +470,11 @@ static void *audio_callback_worker(void *opaque)
             context->frame_count,
             context->host_has_buffer_list ? context->guest_buffer_list : 0,
         };
+        current_audio_callback = context;
         context->guest_status = (int32_t)compat_runtime32_call(
             context->guest_function, guest_arguments,
             sizeof(guest_arguments) / sizeof(guest_arguments[0]));
+        current_audio_callback = NULL;
         if (compat_runtime32_last_call_trapped()) {
             fprintf(stderr,
                     "compat32: guest audio callback 0x%08x escaped\n",
@@ -619,8 +626,11 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
             context->owner_graph = owner_graph;
             context->callback_node = callback_node;
             context->callback_bus = callback_bus;
+            context->callback_unit = NULL;
+            context->callback_scope = 0;
             __atomic_store_n(&context->in_use, true, __ATOMIC_RELEASE);
             context->callback_attached = true;
+            context->retire_after_response = false;
             context->muted = false;
             context->guest_function = function;
             context->guest_refcon = refcon;
@@ -699,6 +709,13 @@ static struct audio_callback_context *new_audio_callback(uint32_t function,
 static void release_audio_callback(struct audio_callback_context *context)
 {
     if (!context) return;
+    /* A guest render notification may remove itself. Its worker already
+       holds this lock, and the IO thread still needs its response buffers. */
+    if (context == current_audio_callback) {
+        context->callback_attached = false;
+        context->retire_after_response = true;
+        return;
+    }
     pthread_mutex_lock(&context->lock);
     context->in_use = false;
     context->callback_attached = false;
@@ -737,6 +754,21 @@ static uint32_t release_audio_callbacks_for_graph(AUGraph graph)
     }
     pthread_mutex_unlock(&audio_callback_registry_lock);
     return released;
+}
+
+/* SetRenderCallback replaces one property's callback; Core Audio no longer
+   references the old refcon after the setter succeeds. Retire its bridge
+   context too, including when the guest clears the property with a null fn. */
+static void release_replaced_unit_callbacks(AudioUnit unit, UInt32 scope,
+    UInt32 bus, struct audio_callback_context *replacement, bool all)
+{
+    uint32_t count = __atomic_load_n(&audio_callback_count, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; ++i) {
+        struct audio_callback_context *old = audio_callbacks[i];
+        if (old != replacement && old->in_use && old->callback_unit == unit &&
+            (all || (old->callback_scope == scope && old->callback_bus == bus)))
+            release_audio_callback(old);
+    }
 }
 
 /*
@@ -1031,6 +1063,14 @@ static OSStatus host_audio_callback(void *refcon,
         }
     }
 
+    if (context->retire_after_response) {
+        context->in_use = false;
+        context->callback_attached = false;
+        context->owner_graph = NULL;
+        context->guest_function = 0;
+        context->guest_refcon = 0;
+        context->retire_after_response = false;
+    }
     pthread_mutex_unlock(&context->lock);
     return status;
 }
@@ -1050,6 +1090,11 @@ static uint32_t detach_audio_callbacks_for_graph(AUGraph graph,
             if (strcmp(context->callback_kind, "render-notify") == 0) {
                 status = AUGraphRemoveRenderNotify(
                     graph, host_audio_callback, context);
+            } else if (context->callback_unit) {
+                AURenderCallbackStruct empty = {0};
+                status = AudioUnitSetProperty(context->callback_unit,
+                    kAudioUnitProperty_SetRenderCallback, context->callback_scope,
+                    context->callback_bus, &empty, sizeof(empty));
             } else {
                 status = AUGraphDisconnectNodeInput(
                     graph, context->callback_node, context->callback_bus);
@@ -1803,11 +1848,305 @@ static OSStatus set_unit_parameter_for_guest(const uint32_t *arguments,
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
+struct legacy_property_listener {
+    AudioUnit unit; uint32_t token, callback, refcon; AudioUnitPropertyID property;
+    bool active; struct legacy_property_listener *next;
+};
+static struct legacy_property_listener *legacy_property_listeners;
+static void legacy_property_changed(void *refcon, AudioUnit unit, AudioUnitPropertyID property,
+                                    AudioUnitScope scope, AudioUnitElement element) {
+    (void)unit;
+    struct legacy_property_listener *listener = refcon;
+    if (!listener->active) return;
+    uint32_t args[] = {listener->refcon, listener->token, property, scope, element};
+    compat_runtime32_call(listener->callback, args, 5);
+}
+static AudioConverterRef legacy_converters[256];
+static uint32_t legacy_converter_count;
+static pthread_mutex_t legacy_converter_lock = PTHREAD_MUTEX_INITIALIZER;
+static AudioConverterRef legacy_converter(uint32_t token) {
+    if (token < 0x75600000 || (token - 0x75600000) % 16) return NULL;
+    uint32_t i = (token - 0x75600000) / 16;
+    pthread_mutex_lock(&legacy_converter_lock);
+    AudioConverterRef converter = i < legacy_converter_count ? legacy_converters[i] : NULL;
+    pthread_mutex_unlock(&legacy_converter_lock);
+    return converter;
+}
+struct legacy_converter_input { uint32_t token, function, refcon; };
+static OSStatus legacy_converter_fill(AudioConverterRef converter, UInt32 *packets,
+    AudioBufferList *buffers, AudioStreamPacketDescription **descriptions, void *refcon) {
+    (void)converter;
+    struct legacy_converter_input *input = refcon;
+    unsigned count = buffers->mNumberBuffers;
+    if (!count || count > 32) return kAudio_ParamError;
+    uint32_t memory = compat_runtime32_allocate(12 + count * 12, 1);
+    if (!memory) return kAudio_MemFullError;
+    uint32_t *guest = (void *)(uintptr_t)memory;
+    guest[0] = *packets; guest[1] = count;
+    for (unsigned i = 0; i < count; ++i) {
+        guest[2 + i*3] = buffers->mBuffers[i].mNumberChannels;
+        guest[3 + i*3] = buffers->mBuffers[i].mDataByteSize;
+    }
+    uint32_t desc = memory + 8 + count * 12;
+    uint32_t args[] = {input->token, memory, memory + 4, desc, input->refcon};
+    OSStatus status = (OSStatus)compat_runtime32_call(input->function, args, 5);
+    *packets = guest[0];
+    if (guest[1] > count) status = kAudio_ParamError;
+    else {
+        buffers->mNumberBuffers = guest[1];
+        for (unsigned i = 0; i < guest[1]; ++i) {
+            buffers->mBuffers[i].mNumberChannels = guest[2 + i*3];
+            buffers->mBuffers[i].mDataByteSize = guest[3 + i*3];
+            buffers->mBuffers[i].mData = (void *)(uintptr_t)guest[4 + i*3];
+        }
+        if (descriptions) *descriptions = (void *)(uintptr_t)*(uint32_t *)(uintptr_t)desc;
+    }
+    compat_runtime32_deallocate(memory);
+    return status;
+}
+static AudioComponent legacy_components[256];
+static uint32_t legacy_component_count;
+static uint32_t legacy_component_handle(AudioComponent component) {
+    if (!component) return 0;
+    for (uint32_t i = 0; i < legacy_component_count; ++i)
+        if (legacy_components[i] == component) return 0x75420000 + i * 16;
+    if (legacy_component_count >= 256) return 0;
+    legacy_components[legacy_component_count] = component;
+    return 0x75420000 + legacy_component_count++ * 16;
+}
+static AudioComponent legacy_component(uint32_t token) {
+    if (token < 0x75420000 || (token - 0x75420000) % 16) return NULL;
+    uint32_t i = (token - 0x75420000) / 16;
+    return i < legacy_component_count ? legacy_components[i] : NULL;
+}
+int audio_bridge32_run_converter_self_test(void)
+{
+    uint32_t memory = compat_runtime32_allocate(512, 1);
+    if (!memory) return -1;
+    unsigned char *bytes = (void *)(uintptr_t)memory;
+    AudioStreamBasicDescription source = {44100, kAudioFormatLinearPCM,
+        kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked, 2, 1, 2, 1, 16, 0};
+    AudioStreamBasicDescription destination = {44100, kAudioFormatLinearPCM,
+        kAudioFormatFlagsNativeFloatPacked, 4, 1, 4, 1, 32, 0};
+    memcpy(bytes, &source, sizeof(source));
+    memcpy(bytes + 40, &destination, sizeof(destination));
+    for (unsigned j = 0; j < 32; ++j) ((int16_t *)(bytes + 88))[j] = j * 512;
+    unsigned completed = 0;
+    for (; completed < 1024; ++completed) {
+        uint64_t result = 0;
+        uint32_t create[] = {memory, memory + 40, memory + 80};
+        audio_bridge32_dispatch("_AudioConverterNew", create, &result);
+        if (result != noErr) {
+            fprintf(stderr, "Audio converter regression: creation %u status=%d\n", completed, (int32_t)result);
+            break;
+        }
+        uint32_t token = *(uint32_t *)(bytes + 80);
+        *(uint32_t *)(bytes + 84) = 128;
+        uint32_t convert[] = {token, 64, memory + 88, memory + 84, memory + 152};
+        audio_bridge32_dispatch("_AudioConverterConvertBuffer", convert, &result);
+        bool failed = result != noErr || *(uint32_t *)(bytes + 84) != 128;
+        for (unsigned j = 0; !failed && j < 32; ++j)
+            if (((float *)(bytes + 152))[j] != j / 64.0f) failed = true;
+        audio_bridge32_dispatch("_AudioConverterDispose", &token, &result);
+        if (failed || result != noErr) break;
+    }
+    compat_runtime32_deallocate(memory);
+    fprintf(stderr, "Audio converter lifecycle %s (%u/1024 create, PCM conversion, dispose cycles; %u slots)\n",
+        completed == 1024 ? "PASS" : "FAIL", completed, legacy_converter_count);
+    return completed == 1024 ? 0 : -1;
+}
+
+int audio_bridge32_run_callback_replacement_self_test(void)
+{
+    AudioComponentDescription description = {
+        kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0
+    };
+    AudioComponent component = AudioComponentFindNext(NULL, &description);
+    uint32_t handles[2] = {0}, memory = compat_runtime32_allocate(8, 1);
+    int failed = !memory || !component;
+    for (unsigned i = 0; !failed && i < 2; ++i) {
+        AudioUnit unit = NULL;
+        failed = AudioComponentInstanceNew(component, &unit) != noErr;
+        if (!failed) handles[i] = guest_handle_for_unit(unit, NULL);
+        if (!handles[i]) failed = 1;
+    }
+    for (unsigned i = 0; !failed && i < 1024; ++i) {
+        uint32_t *guest = (void *)(uintptr_t)memory;
+        guest[0] = 0x1000; /* Never executed: these units are not initialized. */
+        guest[1] = i;
+        uint32_t args[] = {handles[i == 0 ? 1 : 0],
+            kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, memory, 8};
+        uint64_t result = 0;
+        failed = !audio_bridge32_dispatch("_AudioUnitSetProperty", args, &result) || result != noErr;
+        unsigned active = 0;
+        for (unsigned j = 0; j < audio_callback_count; ++j) active += audio_callbacks[j]->in_use;
+        if (active != (i == 0 ? 1 : 2) || audio_callback_count > 3) failed = 1;
+    }
+    if (!failed) {
+        memset((void *)(uintptr_t)memory, 0, 8);
+        uint32_t args[] = {handles[0], kAudioUnitProperty_SetRenderCallback,
+            kAudioUnitScope_Input, 0, memory, 8};
+        uint64_t result = 0;
+        audio_bridge32_dispatch("_AudioUnitSetProperty", args, &result);
+        unsigned active = 0;
+        for (unsigned j = 0; j < audio_callback_count; ++j) active += audio_callbacks[j]->in_use;
+        failed = result != noErr || active != 1;
+    }
+    for (unsigned i = 0; i < 2; ++i) if (handles[i]) {
+        uint64_t result = 0;
+        audio_bridge32_dispatch("_CloseComponent", &handles[i], &result);
+        if (result != noErr) failed = 1;
+    }
+    for (unsigned j = 0; j < audio_callback_count; ++j)
+        if (audio_callbacks[j]->in_use) failed = 1;
+    if (memory) compat_runtime32_deallocate(memory);
+    fprintf(stderr, "Audio callback replacement %s (1024 setters, independent units, clear and dispose; %u slots)\n",
+        failed ? "FAIL" : "PASS", audio_callback_count);
+    return failed ? -1 : 0;
+}
+
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
 {
     if(audio_queue_bridge32_dispatch(import_name,arguments,result))return 1;
     const size_t import_length = strlen(import_name);
+    if (!strcmp(import_name, "_FindNextComponent") && arguments[1]) {
+        const AudioComponentDescription *desc = (void *)(uintptr_t)arguments[1];
+        if (desc->componentType == kAudioUnitType_Mixer || desc->componentType == kAudioUnitType_Output ||
+            desc->componentType == kAudioUnitType_FormatConverter || desc->componentType == kAudioUnitType_Effect) {
+            *result = legacy_component_handle(AudioComponentFindNext(legacy_component(arguments[0]), desc));
+            return 1;
+        }
+    }
+    if (!strcmp(import_name, "_CallComponentVersion") && legacy_component(arguments[0])) {
+        UInt32 version = 0; AudioComponentGetVersion(legacy_component(arguments[0]), &version);
+        *result = version; return 1;
+    }
+    if (!strcmp(import_name, "_OpenComponent") && legacy_component(arguments[0])) {
+        AudioComponentInstance unit = NULL;
+        OSStatus status = AudioComponentInstanceNew(legacy_component(arguments[0]), &unit);
+        *result = status ? 0 : guest_handle_for_unit(unit, NULL); return 1;
+    }
+    if (!strcmp(import_name, "_CallComponentVersion") && unit_for_guest(arguments[0], NULL)) {
+        UInt32 version = 0;
+        AudioComponentGetVersion(AudioComponentInstanceGetComponent(unit_for_guest(arguments[0], NULL)), &version);
+        *result = version; return 1;
+    }
+    if (!strcmp(import_name, "_CloseComponent") && unit_for_guest(arguments[0], NULL)) {
+        AUGraph owner = NULL;
+        AudioUnit unit = unit_for_guest(arguments[0], &owner);
+        if (owner) { *result = (uint32_t)kAudio_ParamError; return 1; }
+        for (struct legacy_property_listener *listener = legacy_property_listeners; listener; listener = listener->next)
+            if (listener->unit == unit && listener->active) {
+                listener->active = false;
+                AudioUnitRemovePropertyListenerWithUserData(unit, listener->property, legacy_property_changed, listener);
+            }
+        OSStatus status = AudioComponentInstanceDispose(unit);
+        if (!status) {
+            release_replaced_unit_callbacks(unit, 0, 0, NULL, true);
+            pthread_mutex_lock(&audio_object_lock);
+            unit_objects[(arguments[0] - kGuestUnitHandleBase) / kGuestAudioHandleStride] = NULL;
+            pthread_mutex_unlock(&audio_object_lock);
+        }
+        *result = (uint32_t)status; return 1;
+    }
+    if (!strcmp(import_name, "_AudioUnitAddPropertyListener")) {
+        AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        if (!unit || !arguments[2]) { *result = (uint32_t)kAudio_ParamError; return 1; }
+        struct legacy_property_listener *listener = calloc(1, sizeof(*listener));
+        if (!listener) { *result = (uint32_t)kAudio_MemFullError; return 1; }
+        *listener = (struct legacy_property_listener){unit, arguments[0], arguments[2], arguments[3], arguments[1], true, NULL};
+        OSStatus status = AudioUnitAddPropertyListener(unit, arguments[1], legacy_property_changed, listener);
+        if (status) free(listener);
+        else { listener->next = legacy_property_listeners; legacy_property_listeners = listener; }
+        *result = (uint32_t)status; return 1;
+    }
+    if (!strcmp(import_name, "_AUGraphIsRunning") || !strcmp(import_name, "_AUGraphUpdate")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        Boolean value = false;
+        OSStatus status = kAudio_ParamError;
+        if (graph) status = !strcmp(import_name, "_AUGraphIsRunning") ?
+            AUGraphIsRunning(graph, &value) : AUGraphUpdate(graph, &value);
+        if (arguments[1]) *(uint8_t *)(uintptr_t)arguments[1] = value;
+        *result = (uint32_t)status; return 1;
+    }
+    if (!strcmp(import_name, "_AUGraphDisconnectNodeInput")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        mark_graph_unpoolable(arguments[0]);
+        *result = (uint32_t)(graph ? AUGraphDisconnectNodeInput(graph, arguments[1], arguments[2]) : kAudio_ParamError);
+        return 1;
+    }
+    if (!strcmp(import_name, "_AudioUnitInitialize")) {
+        AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        *result = (uint32_t)(unit ? AudioUnitInitialize(unit) : kAudio_ParamError); return 1;
+    }
+    if (!strcmp(import_name, "_AUGraphNewNode")) {
+        if (arguments[2] || arguments[3]) { *result = (uint32_t)kAudio_ParamError; return 1; }
+        uint32_t adapted[] = {arguments[0], arguments[1], arguments[4]};
+        return audio_bridge32_dispatch("_AUGraphAddNode", adapted, result);
+    }
+    if (!strcmp(import_name, "_AUGraphGetNodeInfo")) {
+        if (arguments[3]) *(uint32_t *)(uintptr_t)arguments[3] = 0;
+        uint32_t adapted[] = {arguments[0], arguments[1], arguments[2], arguments[5]};
+        return audio_bridge32_dispatch("_AUGraphNodeInfo", adapted, result);
+    }
+    if (!strcmp(import_name, "_AudioConverterNew")) {
+        AudioStreamBasicDescription source, destination;
+        memcpy(&source, (void *)(uintptr_t)arguments[0], sizeof(source));
+        memcpy(&destination, (void *)(uintptr_t)arguments[1], sizeof(destination));
+        AudioConverterRef converter = NULL;
+        OSStatus status = AudioConverterNew(&source, &destination, &converter);
+        uint32_t token = 0;
+        if (status == noErr) {
+            pthread_mutex_lock(&legacy_converter_lock);
+            uint32_t slot = 0;
+            while (slot < legacy_converter_count && legacy_converters[slot]) ++slot;
+            if (slot < 256) {
+                legacy_converters[slot] = converter;
+                if (slot == legacy_converter_count) ++legacy_converter_count;
+                token = 0x75600000 + slot * 16;
+            } else status = kAudio_MemFullError;
+            pthread_mutex_unlock(&legacy_converter_lock);
+            if (status != noErr) AudioConverterDispose(converter);
+        }
+        if (status != noErr)
+            fprintf(stderr, "compat32: AudioConverterNew failed status=%d source=%08x/%g/%u destination=%08x/%g/%u\n",
+                (int)status, (unsigned)source.mFormatID, source.mSampleRate, (unsigned)source.mChannelsPerFrame,
+                (unsigned)destination.mFormatID, destination.mSampleRate, (unsigned)destination.mChannelsPerFrame);
+        if (arguments[2]) *(uint32_t *)(uintptr_t)arguments[2] = token;
+        *result = (uint32_t)status; return 1;
+    }
+    if (!strncmp(import_name, "_AudioConverter", 15) && legacy_converter(arguments[0])) {
+        AudioConverterRef converter = legacy_converter(arguments[0]);
+        OSStatus status = kAudio_ParamError;
+        if (!strcmp(import_name, "_AudioConverterDispose")) {
+            status = AudioConverterDispose(converter);
+            if (status == noErr) {
+                pthread_mutex_lock(&legacy_converter_lock);
+                legacy_converters[(arguments[0] - 0x75600000)/16] = NULL;
+                pthread_mutex_unlock(&legacy_converter_lock);
+            }
+        } else if (!strcmp(import_name, "_AudioConverterReset")) status = AudioConverterReset(converter);
+        else if (!strcmp(import_name, "_AudioConverterConvertBuffer"))
+            status = AudioConverterConvertBuffer(converter, arguments[1], (void *)(uintptr_t)arguments[2],
+                (UInt32 *)(uintptr_t)arguments[3], (void *)(uintptr_t)arguments[4]);
+        else if (!strcmp(import_name, "_AudioConverterFillComplexBuffer")) {
+            uint32_t *guest = (void *)(uintptr_t)arguments[4];
+            unsigned count = guest[0];
+            if (!count || count > 32) { *result = (uint32_t)kAudio_ParamError; return 1; }
+            AudioBufferList *buffers = calloc(1, sizeof(AudioBufferList) + (count - 1)*sizeof(AudioBuffer));
+            if (!buffers) { *result = (uint32_t)kAudio_MemFullError; return 1; }
+            buffers->mNumberBuffers = count;
+            for (unsigned i = 0; i < count; ++i)
+                buffers->mBuffers[i] = (AudioBuffer){guest[1+i*3], guest[2+i*3], (void *)(uintptr_t)guest[3+i*3]};
+            struct legacy_converter_input input = {arguments[0], arguments[1], arguments[2]};
+            status = AudioConverterFillComplexBuffer(converter, legacy_converter_fill, &input,
+                (UInt32 *)(uintptr_t)arguments[3], buffers, (void *)(uintptr_t)arguments[5]);
+            for (unsigned i = 0; i < count; ++i) guest[2+i*3] = buffers->mBuffers[i].mDataByteSize;
+            free(buffers);
+        }
+        *result = (uint32_t)status; return 1;
+    }
     if (audio_op_is_recorded(import_name)) {
         AUGraph graph = graph_for_guest(arguments[0]);
         if (!graph) (void)unit_for_guest(arguments[0], &graph);
@@ -2081,6 +2420,16 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
             graph, (AUNode)arguments[1], arguments[2], &callback)
             : kAudio_ParamError;
         if (status != noErr) release_audio_callback(context);
+        else {
+            uint32_t count = __atomic_load_n(&audio_callback_count, __ATOMIC_ACQUIRE);
+            for (uint32_t i = 0; i < count; ++i) {
+                struct audio_callback_context *old = audio_callbacks[i];
+                if (old != context && old->in_use && old->owner_graph == graph &&
+                    !strcmp(old->callback_kind, "node-input") &&
+                    old->callback_node == (AUNode)arguments[1] &&
+                    old->callback_bus == arguments[2]) release_audio_callback(old);
+            }
+        }
         if (trace_audio()) {
             fprintf(stderr,
                     "compat32: audio SetInputCallback graph=0x%08x node=%u "
@@ -2090,6 +2439,23 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                     guest_callback ? guest_callback[0] : 0,
                     guest_callback ? guest_callback[1] : 0);
             trace_audio_status("AUGraphSetNodeInputCallback", status);
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphRemoveRenderNotify")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        OSStatus status = graph ? noErr : kAudio_ParamError;
+        for (uint32_t index = 0; graph && index < audio_callback_count; ++index) {
+            struct audio_callback_context *context = audio_callbacks[index];
+            if (context->in_use && context->owner_graph == graph &&
+                !strcmp(context->callback_kind, "render-notify") &&
+                context->guest_function == arguments[1] &&
+                context->guest_refcon == arguments[2]) {
+                status = AUGraphRemoveRenderNotify(graph, host_audio_callback, context);
+                if (status == noErr) release_audio_callback(context);
+                break;
+            }
         }
         *result = (uint32_t)status;
         return 1;
@@ -2143,10 +2509,38 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
     }
     if (LP32_NAME_IS(import_name, import_length, "_AudioUnitSetProperty")) {
         AudioUnit unit = synchronized_unit_for_guest(arguments[0]);
+        const void *data = (const void *)(uintptr_t)arguments[4];
+        UInt32 size = arguments[5];
+        struct audio_callback_context *context = NULL;
+        AURenderCallbackStruct callback = {0};
+        if (arguments[1] == kAudioUnitProperty_SetRenderCallback && data && size == 8) {
+            /* The legacy struct contains two 32-bit pointers. Neither the
+               callback address nor its refcon can be passed to Core Audio. */
+            const uint32_t *guest = data;
+            AUGraph owner = NULL;
+            (void)unit_for_guest(arguments[0], &owner);
+            if (guest[0]) {
+                context = new_audio_callback(guest[0], guest[1],
+                                             "unit-input", owner, 0, arguments[3]);
+                if (!context) { *result = (uint32_t)kAudio_MemFullError; return 1; }
+                context->callback_unit = unit;
+                context->callback_scope = arguments[2];
+                callback.inputProc = host_audio_callback;
+                callback.inputProcRefCon = context;
+            }
+            data = &callback;
+            size = sizeof(callback);
+        }
         OSStatus status = unit ? AudioUnitSetProperty(
-            unit, arguments[1], arguments[2], arguments[3],
-            (const void *)(uintptr_t)arguments[4], arguments[5])
+            unit, arguments[1], arguments[2], arguments[3], data, size)
             : kAudio_ParamError;
+        if (status != noErr && context) release_audio_callback(context);
+        if (status == noErr && arguments[1] == kAudioUnitProperty_SetRenderCallback &&
+            arguments[4] && arguments[5] == 8)
+            release_replaced_unit_callbacks(unit, arguments[2], arguments[3], context, false);
+        if (status != noErr) fprintf(stderr,
+            "compat32: AudioUnitSetProperty failed unit=0x%08x property=%u scope=%u element=%u size=%u status=%d\n",
+            arguments[0], arguments[1], arguments[2], arguments[3], size, (int)status);
         if (trace_audio()) {
             fprintf(stderr,
                     "compat32: audio SetProperty unit=0x%08x id=%u scope=%u "

@@ -210,7 +210,7 @@ CLANG := $(shell xcrun --find clang)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 CFLAGS := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0 -O2 -g -Wall -Wextra -Werror
 CXXFLAGS := $(CFLAGS) -std=c++11
-LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segaddr,__LEGACY,0x1000,-segprot,__LEGACY,rwx,rwx
+LDFLAGS := -Wl,-ld_classic,-no_huge,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segaddr,__LEGACY,0x1000,-segprot,__LEGACY,rwx,rwx
 
 .PHONY: test-game-profile all bundle promote-loader icons clean run run-game controller-probe game-info test-controller test-arb-program-guard test-arb-sampler-usage mode-switch-stress
 
