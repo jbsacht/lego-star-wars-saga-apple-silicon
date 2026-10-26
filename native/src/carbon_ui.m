@@ -5,6 +5,8 @@
 #include "carbon_text.h"
 #include "hitch_recorder.h"
 #include "audio_bridge.h"
+#include "saga_controller_keys.h"
+#import <GameController/GameController.h>
 #import <Carbon/Carbon.h>
 #import <Cocoa/Cocoa.h>
 #include <dlfcn.h>
@@ -32,6 +34,7 @@ static BOOL game_application_active(void) {
 }
 static unsigned char game_key_map[16];
 static unsigned char game_hardware_keys[16];
+static uint64_t controller_key_map;
 static unsigned game_deactivation_depth;
 void carbon_ui_begin_deactivation(void) { ++game_deactivation_depth; }
 void carbon_ui_end_deactivation(void) {
@@ -60,6 +63,7 @@ static void flush_game_events(BOOL deliver) {
 static void clear_game_keys(void) {
   memset(game_key_map, 0, sizeof(game_key_map));
   memset(game_hardware_keys, 0, sizeof(game_hardware_keys));
+  controller_key_map = 0;
   flush_game_events(NO);
 }
 @interface LP32GameWindow : NSWindow {
@@ -913,6 +917,106 @@ void *carbon_ui_next_window(void *native) {
   }
   return NULL;
 }
+/* The 2011 App Store edition predates DualSense and uses a different HID
+   record layout from later Saga builds. Feed its existing keyboard path
+   instead of writing later-edition structures into guest memory. */
+static unsigned controller_bindings[12]={13,1,0,2,32,38,4,40,59,49,36,53};
+static void load_controller_bindings(void) {
+  NSString *path=[@"~/Library/Application Support/Feral Interactive/LEGO Star Wars Saga/Controller Keys.plist" stringByExpandingTildeInPath];
+  NSDictionary *config=[NSDictionary dictionaryWithContentsOfFile:path];
+  if (!config) return;
+  NSArray *actions=@[@"MoveUp",@"MoveDown",@"MoveLeft",@"MoveRight",@"Jump",
+      @"Special",@"Attack",@"SwitchCharacter",@"CyclePrevious",@"CycleNext",@"Pause",@"Back"];
+  NSDictionary *codes=@{@"a":@0,@"s":@1,@"d":@2,@"f":@3,@"h":@4,@"g":@5,
+      @"z":@6,@"x":@7,@"c":@8,@"v":@9,@"b":@11,@"q":@12,@"w":@13,
+      @"e":@14,@"r":@15,@"y":@16,@"t":@17,@"o":@31,@"u":@32,@"i":@34,
+      @"p":@35,@"return":@36,@"enter":@36,@"l":@37,@"j":@38,@"k":@40,
+      @"n":@45,@"m":@46,@"tab":@48,@"space":@49,@"escape":@53,@"esc":@53,
+      @"control":@59,@"ctrl":@59};
+  for (unsigned i=0;i<12;++i) {
+    id value=[config objectForKey:actions[i]];
+    if (!value) continue;
+    NSNumber *code=[value isKindOfClass:[NSString class]]?codes[[value lowercaseString]]:nil;
+    if (code) controller_bindings[i]=[code unsignedIntValue];
+    else fprintf(stderr,"compat32: ignored unsupported controller key for %s\n",[actions[i] UTF8String]);
+  }
+  fprintf(stderr,"compat32: loaded custom controller bindings\n");
+}
+static void poll_saga_controller(void) {
+  static GCController *selected;
+  static int stick_x, stick_y;
+  static int enabled = -1;
+  if (enabled < 0) {
+    enabled = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"LP32GuestCodeBundlePath"] != nil &&
+        ![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"LP32DisableControllerKeyboard"] boolValue];
+    if (enabled) load_controller_bindings();
+  }
+  if (!enabled) return;
+  LP32CarbonPanel *panel = panel_for(latest_game_window, NO);
+  if (!panel || !panel->native_rendering || !game_application_active()) {
+    controller_key_map = 0; stick_x = stick_y = 0; return;
+  }
+  NSArray *connected = [GCController controllers];
+  if (selected && ![connected containsObject:selected]) {
+    [selected release]; selected = nil; stick_x = stick_y = 0;
+  }
+  if (!selected) {
+    for (GCController *candidate in connected) {
+      if (![candidate extendedGamepad]) continue;
+      selected = [candidate retain];
+      fprintf(stderr,"compat32: App Store keyboard controller connected: %s\n",
+          [[candidate vendorName] UTF8String]);
+      break;
+    }
+  }
+  GCExtendedGamepad *pad = [selected extendedGamepad];
+  unsigned buttons = 0;
+  if (pad) {
+    stick_x = saga_stick_direction(pad.leftThumbstick.xAxis.value, stick_x);
+    stick_y = saga_stick_direction(pad.leftThumbstick.yAxis.value, stick_y);
+    if (stick_y>0 || pad.dpad.up.isPressed) buttons |= SAGA_PAD_UP;
+    if (stick_y<0 || pad.dpad.down.isPressed) buttons |= SAGA_PAD_DOWN;
+    if (stick_x<0 || pad.dpad.left.isPressed) buttons |= SAGA_PAD_LEFT;
+    if (stick_x>0 || pad.dpad.right.isPressed) buttons |= SAGA_PAD_RIGHT;
+    if (pad.buttonA.isPressed) buttons |= SAGA_PAD_CROSS;
+    if (pad.buttonB.isPressed) buttons |= SAGA_PAD_CIRCLE;
+    if (pad.buttonX.isPressed) buttons |= SAGA_PAD_SQUARE;
+    if (pad.buttonY.isPressed) buttons |= SAGA_PAD_TRIANGLE;
+    if (pad.leftShoulder.isPressed) buttons |= SAGA_PAD_L1;
+    if (pad.rightShoulder.isPressed) buttons |= SAGA_PAD_R1;
+    if (pad.buttonMenu.isPressed) buttons |= SAGA_PAD_MENU;
+    if (pad.buttonOptions.isPressed) buttons |= SAGA_PAD_BACK;
+  }
+  uint64_t next = saga_controller_keys_with_bindings(buttons, 1, controller_bindings);
+  uint64_t changed = next ^ controller_key_map;
+  controller_key_map = next;
+  for (unsigned key=0;key<64;++key) {
+    uint64_t bit = UINT64_C(1)<<key;
+    if (!(changed & bit)) continue;
+    EventRef event = NULL;
+    if (CreateEvent(NULL,kEventClassKeyboard,(next&bit)?kEventRawKeyDown:kEventRawKeyUp,
+          GetCurrentEventTime(),kEventAttributeUserEvent,&event) != noErr) continue;
+    UInt32 code=key, modifiers=0, forwarded=1;
+    char character=0;
+    switch(key) {
+      case 0: character='a'; break; case 1: character='s'; break;
+      case 2: character='d'; break; case 4: character='h'; break;
+      case 13: character='w'; break; case 32: character='u'; break;
+      case 38: character='j'; break; case 40: character='k'; break;
+      case 34: character='i'; break; case 37: character='l'; break;
+      case 31: character='o'; break; case 35: character='p'; break;
+      case 49: character=' '; break; case 36: character='\r'; break;
+      case 53: character=27; break;
+    }
+    SetEventParameter(event,kEventParamKeyCode,typeUInt32,sizeof(code),&code);
+    SetEventParameter(event,kEventParamKeyModifiers,typeUInt32,sizeof(modifiers),&modifiers);
+    SetEventParameter(event,kEventParamKeyMacCharCodes,typeChar,1,&character);
+    SetEventParameter(event,kEventParamWindowRef,typeWindowRef,sizeof(panel->native),&panel->native);
+    SetEventParameter(event,'lp32',typeUInt32,sizeof(forwarded),&forwarded);
+    queue_game_event(event);
+    ReleaseEvent(event);
+  }
+}
 int carbon_ui_game_keys(void *keys) {
   LP32CarbonPanel *p = panel_for(latest_game_window, NO);
   if (!p || !p->native_rendering) return 0;
@@ -925,7 +1029,8 @@ int carbon_ui_game_keys(void *keys) {
        over delayed Cocoa events. Synthetic window events retain their map. */
     game_hardware_keys[i] |= hardware[i];
     ((unsigned char *)keys)[i] = hardware[i] |
-        (game_key_map[i] & ~game_hardware_keys[i]);
+        (game_key_map[i] & ~game_hardware_keys[i]) |
+        (i<8 ? (unsigned char)(controller_key_map>>(8*i)) : 0);
     game_key_map[i] &= hardware[i] | ~game_hardware_keys[i];
   }
   return 1;
@@ -947,6 +1052,7 @@ int carbon_ui_pump_sleep(unsigned int microseconds) {
   }
   /* Post after draining AppKit so it cannot consume our newly translated
      Carbon events before the game's own ReceiveNextEvent loop sees them. */
+  poll_saga_controller();
   flush_game_events(game_application_active());
   pumping = NO;
   return 1;

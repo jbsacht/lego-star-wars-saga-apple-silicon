@@ -275,6 +275,13 @@ test-game-profile: $(BUILD_DIR)/test_game_profile
 	./$(BUILD_DIR)/test_game_profile
 
 .PHONY: test-focus-policy
+.PHONY: test-saga-controller-keys
+$(BUILD_DIR)/test_saga_controller_keys: tests/test_saga_controller_keys.c src/saga_controller_keys.h | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) -Isrc $< -o $@
+
+test-saga-controller-keys: $(BUILD_DIR)/test_saga_controller_keys
+	arch -x86_64 ./$(BUILD_DIR)/test_saga_controller_keys
+
 $(BUILD_DIR)/test_focus_policy: tests/test_focus_policy.m src/focus_policy.m src/focus_policy.h | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) -Isrc tests/test_focus_policy.m src/focus_policy.m -framework Cocoa -o $@
 

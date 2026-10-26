@@ -31,6 +31,14 @@ Earlier targeted checks covered audio callback replacement and AudioConverter sl
 
 ## Remaining validation
 
+Controller follow-up: macOS and the GameController probe detected the connected
+DualSense and its button input. The player confirmed the installed keyboard
+fallback worked. Mapping tests cover diagonals, simultaneous actions, custom
+bindings, clearing held input and stick hysteresis. The updated loader builds
+with warnings treated as errors, and the installed app passes strict signature
+verification. Full analog input, a second controller, and haptics remain outside
+the keyboard fallback's scope; custom bindings need an additional player check.
+
 - Other M-series models and macOS versions.
 - Long active sessions and full campaign completion.
 - Controllers and audible mixing quality in this App Store edition.

@@ -74,6 +74,43 @@ The generated app can be moved into Applications afterward. **Keep the original 
 4. Use the green window button or **Control–Command–F** for macOS fullscreen. The same shortcut exits fullscreen. Black letterboxing may appear to preserve the game's aspect ratio; the image is never intentionally cropped.
 5. After switching apps, select **Resume** if the game is paused.
 
+### Controllers (experimental)
+
+The App Store build includes a player-one keyboard mapping for controllers
+recognized by macOS GameController, including DualSense. Connect the controller,
+click **Play** in the launcher, then press **Options** at the title prompt to
+select the keyboard input device. Leave player one's keyboard bindings at their
+defaults in **Control Setup**.
+
+| Controller | Game action |
+| --- | --- |
+| Left stick / D-pad | Move / navigate |
+| Cross | Jump / select |
+| Square | Attack / defend |
+| Circle | Build / Force / special |
+| Triangle | Switch character / enter or exit vehicle |
+| L1 / R1 | Cycle characters |
+| Options | Enter / start / pause |
+| Create | Escape / back |
+
+This maps to keyboard input: stick movement has eight directions, prompts remain
+keyboard prompts, and controller two, rumble and adaptive triggers are not
+provided by this fallback. Input is restricted to the active game window;
+disconnecting or switching apps clears held controls. It does not install a
+system-wide keyboard mapper.
+
+To match custom keyboard bindings, create or edit
+`~/Library/Application Support/Feral Interactive/LEGO Star Wars Saga/Controller Keys.plist`.
+It is an XML property list with string values for `MoveUp`, `MoveDown`, `MoveLeft`,
+`MoveRight`, `Jump` (Cross), `Attack` (Square), `Special` (Circle),
+`SwitchCharacter` (Triangle), `CyclePrevious` (L1), `CycleNext` (R1), `Pause`
+(Options), and `Back` (Create). For example, `<key>Jump</key><string>L</string>`
+maps Cross to L. Supported keys are A–Z, Return/Enter, Space, Escape/Esc, Tab,
+and Control/Ctrl. Missing or unsupported entries retain their defaults. Restart
+the game after editing; this file does not change the game's keyboard bindings.
+Set `LP32DisableControllerKeyboard` to true in the
+compatibility app's Info.plist before signing to disable the fallback.
+
 The verified configuration had shadows and bloom disabled. If a different configuration fails, include those settings in a bug report. Performance depends on the scene and machine; the bridge caps presentation near 60 FPS because the game simulation is frame dependent.
 
 Settings and saves use the game's existing folder:
